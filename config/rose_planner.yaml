@@ -1,0 +1,61 @@
+rose_navigation_planner_node:
+  ros__parameters:
+    use_sim_time: true
+    rose_planner:
+      robot_radius: 0.2
+      target_frame: map
+      use_control_output: true
+      default_wz: 10.14
+      odometry_topic: /Odometry
+      goal_topic: /rose_goal
+      plan_fps: 10.0
+      a_star:
+        clearance_weight: 2.0
+        obstacle_penalty_weight: 10.0
+        heuristic_weight: 1.0
+        safe_radius: 0.1
+      traj_opt:
+        smooth_weight: 3.0
+        obstacle_weight: 700.0
+        sample_ds: 0.3
+        expected_speed: 2.5
+      mpc:
+        control_fps: 60.0
+        predict_dt: 0.05
+        predict_steps: 20
+        max_iter: 20
+        max_speed: 5.5
+        max_accel: 30.0
+        delay_time: 0.0
+        blind_radius: 0.2
+        Q: [150.0,150.0,0.1,0.1]
+        R:  [1.0, 1.0]
+        Rd: [50.0,50.0]
+    rose_map:
+      odometry_topic: /Odometry
+      pointcloud_topic: /cloud_registered
+      target_frame: map
+      sensor_frame: front_mid360
+      max_update_rate: 10
+      occ_map:
+        log_hit: 0.85
+        log_free: -0.3
+        log_min: -5.0
+        log_max: 10.0
+        occ_th: 0.01       
+        min_shift: 1
+        timeout: 15.5
+        unknown_is_occupied: false
+        use_ray: true
+        max_ray_range: 20.0
+        voxel_map:
+          center: [0.0, 0.0, 0.0]
+          size: [17.0, 17.0, 1.0]
+          voxel_size: 0.03
+      bin_map:
+        voxel_size: 0.05
+        max_slope_deg: 30.0
+        static_map_path: "/home/hy/rose_nav/src/bringup_nav/map/simulation/rmuc_2026.yaml"
+      esdf:
+        use_diagonals: true
+        size: [17.0, 17.0]
