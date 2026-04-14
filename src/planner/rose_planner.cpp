@@ -17,10 +17,12 @@
 #include <string>
 #include <sys/types.h>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <visualization_msgs/msg/marker.hpp>
 namespace rose_nav::planner {
 struct RosePlanner::Impl {
+    static constexpr bool USE_OPT = true;
     enum FSMSTATE : int {
         INIT,
         WAIT_GOAL,
@@ -347,9 +349,24 @@ struct RosePlanner::Impl {
                 }
                 remove_old_traj();
                 auto removed = remove_old_path();
-                auto unsafe_points = checkSafePath(removed);
+                auto unsafe_points = check_safe_path(removed);
                 if (!unsafe_points.empty()) {
                     local_replan(unsafe_points, goal_pos);
+                } else {
+                    double t = 0.0;
+                    std::vector<Eigen::Vector2d> traj_path;
+                    constexpr double horzien = 3.0;
+                    while (t < horzien) {
+                        if (t >= current_traj_.getTotalDuration()) {
+                            break;
+                        }
+                        traj_path.push_back(current_traj_.getPos(t));
+                        t += 0.05;
+                    }
+                    unsafe_points = check_safe_path(traj_path);
+                    if (!unsafe_points.empty()) {
+                        resample_and_opt(removed, std::make_pair(0.0, horzien));
+                    }
                 }
                 if (fsm_ == FSMSTATE::WAIT_GOAL) {
                     change_to_wait = true;
@@ -372,7 +389,7 @@ struct RosePlanner::Impl {
             }
         }
     }
-    std::vector<int> checkSafePath(const std::vector<Eigen::Vector2d>& path) const noexcept {
+    std::vector<int> check_safe_path(const std::vector<Eigen::Vector2d>& path) const noexcept {
         std::vector<int> unsafe_points;
 
         if (path.size() < 2)
@@ -538,7 +555,10 @@ struct RosePlanner::Impl {
         return r;
     }
 
-    void resample_and_opt(const std::vector<Eigen::Vector2d>& path) noexcept {
+    void resample_and_opt(
+        const std::vector<Eigen::Vector2d>& path,
+        std::optional<std::pair<double, double>> some_no_opt = std::nullopt
+    ) noexcept {
         nav_msgs::msg::Path raw_path_msg;
         raw_path_msg.header.stamp = node_->now();
         raw_path_msg.header.frame_id = params_.target_frame;
@@ -558,7 +578,7 @@ struct RosePlanner::Impl {
             }
             raw_path_pub_->publish(raw_path_msg);
         }
-        auto opt_traj_opt = traj_opt_->optimize(path, current);
+        auto opt_traj_opt = traj_opt_->optimize(path, current, USE_OPT, some_no_opt);
 
         if (opt_traj_opt) {
             has_traj_ = true;
