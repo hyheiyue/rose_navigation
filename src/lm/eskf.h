@@ -136,26 +136,6 @@ public:
         }
     }
 
-    inline bool isDiverged() {
-        using T = state::value_type;
-
-        constexpr T kMinDiag = -1e-6;
-        constexpr T kTraceMax = 1e6;
-
-        Eigen::LLT<Eigen::Matrix<T, state::DIM, state::DIM>> llt(P);
-        if (llt.info() != Eigen::Success)
-            return true;
-
-        if ((P.diagonal().array() < kMinDiag).any())
-            return true;
-
-        const T traceP = P.trace();
-        if (!std::isfinite(traceP) || traceP > kTraceMax)
-            return true;
-
-        return false;
-    }
-
     inline bool update_point() {
         point_measurement_result measurement_result;
         h_point(x, measurement_result);

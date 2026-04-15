@@ -70,20 +70,23 @@ struct LMPC::Impl {
         bool has_ref = false;
         double yaw_end = 0.0;
         double w_end = 0.0;
+
         for (int i = 0; i < T_in; ++i) {
             TrajPoint tp;
 
             if (t <= traj_duration_) {
-                Eigen::Vector2d curr_pos = traj_.getPos(t);
-                Eigen::Vector2d vec = curr_pos - now_pos;
+                auto curr_pos = traj_.getPos(t);
+                auto vec = curr_pos - now_pos;
+                auto curr_vel = traj_.getVel(t);
                 if (vec.norm() < params_.blind_radius) {
                     t += dt_in;
                     i--;
                     continue;
                 }
+
                 has_ref = true;
-                tp.pos = traj_.getPos(t);
-                tp.vel = traj_.getVel(t);
+                tp.pos = curr_pos;
+                tp.vel = curr_vel;
                 tp.acc = traj_.getAcc(t);
                 double yaw = traj_.getYaw(t);
                 yaw = yaw_end + angles::shortest_angular_distance(yaw_end, yaw);
@@ -94,6 +97,7 @@ struct LMPC::Impl {
                 acc_end = tp.acc;
                 yaw_end = tp.yaw;
                 w_end = tp.w;
+
             } else {
                 tp.pos = pos_end;
                 tp.vel = Eigen::Vector2d::Zero();

@@ -114,15 +114,13 @@ struct TrajOpt::Impl {
             return std::nullopt;
         }
 
-        const int piece_num = sampled_path_.size() - 1;
-        piece_num_ = piece_num;
-
         Eigen::Matrix<double, 2, 3> head_state;
         head_state << now.pos, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
 
         Eigen::Matrix<double, 2, 3> tail_state;
         tail_state << sampled_path_.back(), Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
-
+        const int piece_num = sampled_path_.size() - 1;
+        piece_num_ = piece_num;
         const auto w_smooth = params_.smooth_weight;
 
         minco_
@@ -223,9 +221,6 @@ struct TrajOpt::Impl {
 
         double cost_val = 0.0;
 
-        // -----------------------------
-        // 1. restore full x
-        // -----------------------------
         Eigen::VectorXd full_x(2 * ctrl_num);
 
         for (int i = 0; i < ctrl_num; ++i) {
@@ -239,18 +234,12 @@ struct TrajOpt::Impl {
             full_x(i + ctrl_num) = x(k + opt_num);
         }
 
-        // -----------------------------
-        // 2. build MINCO input
-        // -----------------------------
         Eigen::Matrix2Xd in_ps(2, ctrl_num);
         in_ps.row(0) = full_x.head(ctrl_num).transpose();
         in_ps.row(1) = full_x.segment(ctrl_num, ctrl_num).transpose();
 
         instance->minco_.setParameters(in_ps, instance->in_times_);
 
-        // -----------------------------
-        // 3. cost computation
-        // -----------------------------
         double energy = 0.0;
 
         Eigen::Matrix2Xd energy_grad = Eigen::Matrix2Xd::Zero(2, ctrl_num);
@@ -279,18 +268,12 @@ struct TrajOpt::Impl {
         cost_val += energy;
         cost_val += instance->attach_penalty_functional(in_ps, gradp);
 
-        // -----------------------------
-        // 4. build full gradient
-        // -----------------------------
         Eigen::VectorXd g_full(2 * ctrl_num);
         g_full.setZero();
 
         g_full.segment(0, ctrl_num) = gradp.row(0).transpose();
         g_full.segment(ctrl_num, ctrl_num) = gradp.row(1).transpose();
 
-        // -----------------------------
-        // 5. compress gradient
-        // -----------------------------
         g.resize(2 * opt_num);
         g.setZero();
 

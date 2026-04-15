@@ -588,7 +588,7 @@ struct RosePlanner::Impl {
                  || opt_marker_pub_->get_subscription_count() > 0)
                 && opt_traj.getPieceNum() > 1)
             {
-                double dt = 0.1;
+                double dt = 0.05;
                 int sample_num = static_cast<int>(opt_traj.getTotalDuration() / dt) + 2;
 
                 double t_cur = 0.0;

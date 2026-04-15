@@ -20,9 +20,9 @@ def generate_launch_description():
                 ]
             )
         ],
-        # prefix='gnome-terminal -- bash -c "gdb -ex run --args $(ros2 pkg prefix rose_navigation)/lib/rose_navigation/rose_navigation_planner_node \
-        # --ros-args -r __node:=rose_navigation_planner_node \
-        # --params-file $(ros2 pkg prefix rose_navigation)/share/rose_navigation/config/rose_planner.yaml; exec bash"'
+        prefix='gnome-terminal -- bash -c "gdb -ex run --args $(ros2 pkg prefix rose_navigation)/lib/rose_navigation/rose_navigation_planner_node \
+        --ros-args -r __node:=rose_navigation_planner_node \
+        --params-file $(ros2 pkg prefix rose_navigation)/share/rose_navigation/config/rose_planner.yaml; exec bash"'
     )
   
 

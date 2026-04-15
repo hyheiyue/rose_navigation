@@ -162,19 +162,36 @@ struct SmallPointLIO::Impl {
         }
     } log_ctx_;
     void handle_once() {
-        static double time_current = -1;
+        static double time_current = -1.0;
         static bool is_inited = false;
-        static std::vector<Eigen::Vector3f> pointcloud_odom_frame;
+        std::vector<Eigen::Vector3f> pointcloud_odom_frame;
+
         auto start = std::chrono::steady_clock::now();
+
+        auto has_lidar = [&]() -> bool {
+            return params_.batch_update ? !preprocess_.point_batch_deque.empty()
+                                        : !preprocess_.point_deque.empty();
+        };
+
+        auto lidar_timestamp = [&]() -> double {
+            return params_.batch_update ? preprocess_.point_batch_deque.front().timestamp
+                                        : preprocess_.point_deque.front().timestamp;
+        };
+
+        auto has_dense = [&]() -> bool {
+            return !use_dense_points() || !preprocess_.dense_point_deque.empty();
+        };
+
         if (!is_inited) {
             int total_points = 0;
             if (params_.batch_update) {
                 for (const auto& b: preprocess_.point_batch_deque) {
-                    total_points += b.points.size();
+                    total_points += static_cast<int>(b.points.size());
                 }
             } else {
-                total_points = preprocess_.point_deque.size();
+                total_points = static_cast<int>(preprocess_.point_deque.size());
             }
+
             if ((!preprocess_.imu_deque.empty() || total_points > 0)
                 && total_points >= estimator_->params_.init_map_size
                 && (!estimator_->params_.fix_gravity_direction
@@ -191,24 +208,25 @@ struct SmallPointLIO::Impl {
                         estimator_->ivox->add_point(point.position);
                     }
                 }
-                // fix gravity direction
+
                 if (estimator_->params_.fix_gravity_direction) {
                     estimator_->kf.x.gravity = Eigen::Matrix<state::value_type, 3, 1>::Zero();
                     for (const auto& imu_msg: preprocess_.imu_deque) {
                         estimator_->kf.x.gravity +=
                             imu_msg.linear_acceleration.cast<state::value_type>();
                     }
+
                     state::value_type scale =
                         -static_cast<state::value_type>(estimator_->params_.gravity.norm())
                         / estimator_->kf.x.gravity.norm();
                     estimator_->kf.x.gravity *= scale;
-
                 } else {
                     estimator_->kf.x.gravity =
                         estimator_->params_.gravity.cast<state::value_type>();
                 }
+
                 estimator_->kf.x.acceleration = -estimator_->kf.x.gravity;
-                // init time
+
                 if (params_.batch_update) {
                     if (preprocess_.point_batch_deque.empty()) {
                         time_current = preprocess_.imu_deque.back().timestamp;
@@ -234,15 +252,17 @@ struct SmallPointLIO::Impl {
                 }
 
                 estimator_->kf.init_timestamp(time_current);
-                // clear data
+
                 preprocess_.dense_point_deque.clear();
                 preprocess_.point_batch_deque.clear();
                 preprocess_.point_deque.clear();
                 preprocess_.imu_deque.clear();
+
                 is_inited = true;
             }
             return;
         }
+
         bool is_publish_odometry = false;
         if (params_.batch_update) {
             is_publish_odometry = !preprocess_.imu_deque.empty()
@@ -252,24 +272,24 @@ struct SmallPointLIO::Impl {
                 && preprocess_.point_batch_deque.back().timestamp
                     > preprocess_.imu_deque.front().timestamp;
         } else {
-            is_publish_odometry = !preprocess_.imu_deque.empty()
-                && !preprocess_.dense_point_deque.empty() && !preprocess_.point_deque.empty()
+            is_publish_odometry = !preprocess_.imu_deque.empty() && !preprocess_.point_deque.empty()
                 && preprocess_.imu_deque.front().timestamp
                     < preprocess_.point_deque.back().timestamp;
         }
-        while ((!params_.batch_update ? !preprocess_.point_deque.empty()
-                                      : !preprocess_.point_batch_deque.empty())
-               && !preprocess_.imu_deque.empty() && !preprocess_.dense_point_deque.empty())
-        {
-            const common::Batch& batch_frame = preprocess_.point_batch_deque.front();
-            const common::Point& point_lidar_frame = preprocess_.point_deque.front();
-            const common::ImuMsg& imu_msg = preprocess_.imu_deque.front();
-            const common::Point& dense_point_lidar_frame = preprocess_.dense_point_deque.front();
-            auto lidar_timestamp =
-                params_.batch_update ? batch_frame.timestamp : point_lidar_frame.timestamp;
-            if (dense_point_lidar_frame.timestamp < lidar_timestamp
-                && dense_point_lidar_frame.timestamp < imu_msg.timestamp)
-            {
+
+        const bool use_dense = use_dense_points();
+
+        while (has_lidar() && !preprocess_.imu_deque.empty() && has_dense()) {
+            const double imu_ts = preprocess_.imu_deque.front().timestamp;
+            const double lidar_ts = lidar_timestamp();
+            const double dense_ts = (use_dense && !preprocess_.dense_point_deque.empty())
+                ? preprocess_.dense_point_deque.front().timestamp
+                : std::numeric_limits<double>::infinity();
+
+            if (use_dense && dense_ts < lidar_ts && dense_ts < imu_ts) {
+                const common::Point& dense_point_lidar_frame =
+                    preprocess_.dense_point_deque.front();
+
                 Eigen::Matrix<state::value_type, 3, 1> dense_point_imu_frame;
                 if (estimator_->params_.extrinsic_est_en) {
                     dense_point_imu_frame = estimator_->kf.x.offset_R_L_I
@@ -280,52 +300,66 @@ struct SmallPointLIO::Impl {
                             * dense_point_lidar_frame.position.cast<state::value_type>()
                         + estimator_->Lidar_T_wrt_IMU;
                 }
+
                 pointcloud_odom_frame.emplace_back(
                     (estimator_->kf.x.rotation * dense_point_imu_frame + estimator_->kf.x.position)
                         .cast<float>()
                 );
                 preprocess_.dense_point_deque.pop_front();
-            } else if (lidar_timestamp < imu_msg.timestamp) {
+                continue;
+            }
+
+            if (lidar_ts < imu_ts) {
                 if (params_.batch_update) {
+                    const common::Batch& batch_frame = preprocess_.point_batch_deque.front();
+
                     if (batch_frame.timestamp < time_current) {
                         preprocess_.point_batch_deque.pop_front();
                         continue;
                     }
+
                     time_current = batch_frame.timestamp;
                     estimator_->kf.predict_state(time_current);
                     estimator_->current_batch = batch_frame;
                     estimator_->kf.update_iterated_batch();
+
                     for (const auto& point: estimator_->points_odom_frame) {
                         estimator_->ivox->add_point(point);
                     }
-                    preprocess_.point_batch_deque.pop_front();
+
                     log_ctx_.processed_points += estimator_->points_odom_frame.size();
+                    preprocess_.point_batch_deque.pop_front();
                 } else {
-                    if (point_lidar_frame.timestamp < time_current) {
+                    const common::Point& point_lidar_frame = preprocess_.point_deque.front();
+
+                    if (point_lidar_frame.timestamp < time_current || point_lidar_frame.count < 1) {
                         preprocess_.point_deque.pop_front();
                         continue;
                     }
+
                     time_current = point_lidar_frame.timestamp;
                     estimator_->kf.predict_state(time_current);
                     estimator_->point_lidar_frame = point_lidar_frame.position;
                     estimator_->kf.update_point();
                     estimator_->ivox->add_point(estimator_->point_odom_frame);
-                    preprocess_.point_deque.pop_front();
-                    log_ctx_.processed_points++;
-                }
 
+                    log_ctx_.processed_points++;
+                    preprocess_.point_deque.pop_front();
+                }
+                continue;
             } else {
-                // imu update
+                const common::ImuMsg& imu_msg = preprocess_.imu_deque.front();
+
                 if (imu_msg.timestamp < time_current) {
                     preprocess_.imu_deque.pop_front();
                     continue;
                 }
+
                 time_current = imu_msg.timestamp;
 
-                // predict
                 estimator_->kf.predict_state(time_current);
                 estimator_->kf.predict_cov(time_current, Q);
-                // update
+
                 estimator_->angular_velocity = imu_msg.angular_velocity.cast<state::value_type>();
                 estimator_->linear_acceleration =
                     imu_msg.linear_acceleration.cast<state::value_type>();
@@ -335,7 +369,6 @@ struct SmallPointLIO::Impl {
             }
         }
 
-        preprocess_.dense_point_deque.clear();
         if (is_publish_odometry) {
             common::Odometry odometry;
             odometry.timestamp = time_current;
@@ -345,20 +378,18 @@ struct SmallPointLIO::Impl {
             odometry.angular_velocity = estimator_->kf.x.omg.cast<double>();
 
             publish_odometry(odometry);
+
             if (!pointcloud_odom_frame.empty()) {
                 publish_pointCloud(pointcloud_odom_frame);
             }
+
             pointcloud_odom_frame.clear();
-            // auto p = std::async(std::launch::async, [this, odometry, cloud]() mutable {
-            //     publish_odometry(odometry);
-            //     if (!cloud.empty()) {
-            //         publish_pointCloud(cloud);
-            //     }
-            // });
         }
+
         auto end = std::chrono::steady_clock::now();
         auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         log_ctx_.cost_ms += cost;
+
         utils::dt_once(
             [&]() {
                 RCLCPP_INFO_STREAM(
@@ -696,6 +727,9 @@ struct SmallPointLIO::Impl {
             }
         );
     }
+    bool use_dense_points() {
+        return utils::publisher_sub(pointcloud_pub_) || pcd_mapping;
+    }
     void on_point_cloud_callback(const std::vector<common::Point>& pointcloud) {
         static double last_batch_timestamp = -1.0;
         static double last_lidar_timestamp = -1.0;
@@ -716,7 +750,7 @@ struct SmallPointLIO::Impl {
             if (dist < params_.min_distance_squared || dist > params_.max_distance_squared) {
                 continue;
             }
-            if (point.timestamp >= last_timestamp_dense_point) {
+            if (point.timestamp >= last_timestamp_dense_point && use_dense_points()) {
                 dense_points.push_back(point);
             }
             if (i % params_.point_filter_num != 0) {

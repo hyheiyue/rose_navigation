@@ -19,7 +19,7 @@ struct ImuMsg {
 struct Point {
     double timestamp; // Unit: s
     Eigen::Vector3f position; // Unit: m
-    int count = 1;
+    int count = 0;
 };
 struct Batch {
     double timestamp; // Unit: s

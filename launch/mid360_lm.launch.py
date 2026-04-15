@@ -20,9 +20,9 @@ def generate_launch_description():
                 ]
             )
         ],
-        # prefix='gnome-terminal -- bash -c "gdb -ex run --args $(ros2 pkg prefix rose_navigation)/lib/rose_navigation/rose_navigation_lm_node \
-        # --ros-args -r __node:=rose_navigation_lm_node \
-        # --params-file $(ros2 pkg prefix rose_navigation)/share/rose_navigation/config/mid360_lm.yaml; exec bash"'
+        prefix='gnome-terminal -- bash -c "gdb -ex run --args $(ros2 pkg prefix rose_navigation)/lib/rose_navigation/rose_navigation_lm_node \
+        --ros-args -r __node:=rose_navigation_lm_node \
+        --params-file $(ros2 pkg prefix rose_navigation)/share/rose_navigation/config/mid360_lm.yaml; exec bash"'
     )
     static_base_link_to_livox_frame = Node(
         package="tf2_ros",

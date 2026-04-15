@@ -187,15 +187,13 @@ struct RoseMap::Impl {
                 std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
             utils::dt_once(
                 [&]() {
-                    auto& log_ctx = occ_map_->log_ctx_;
+                    auto& log_ctx = occ_map_->get_log_ctx();
                     RCLCPP_INFO_STREAM(
                         rclcpp::get_logger("rose_nav::map"),
                         "receive: " << log_ctx.receive_count << " cost: " << log_ctx.receive_cost
                                     << "ms"
                                     << " free: " << log_ctx.free_count
                                     << " cost: " << log_ctx.free_cost << "ms"
-                                    << " hit: " << log_ctx.hit_count
-                                    << " cost: " << log_ctx.hit_cost << "ms"
                                     << " ray: cost: " << log_ctx.ray_cost << "ms"
                                     << " up: " << update_count << " update: " << update_cost << "ms"
                     );
@@ -284,12 +282,34 @@ struct RoseMap::Impl {
             return;
         }
         auto& bin_voxel = bin->voxel_map_;
-        auto& voxel_3d = occ_map_->voxel_map_;
-        auto max_k_3d = voxel_3d->max_key;
-        auto max_p_3d = voxel_3d->key_to_world(max_k_3d);
-        auto min_k_3d = voxel_3d->min_key;
-        auto min_p_3d = voxel_3d->key_to_world(min_k_3d);
-        auto occupied_idxs_3d = occ_map_->occupied_buffer_idx_;
+        auto voxel_3d = occ_map_->get_voxel_map();
+        static std::unique_ptr<SlidingVoxelMap<2, float>> slope_map;
+        if (!slope_map) {
+            auto max_k_3d = voxel_3d->max_key;
+            auto max_p_3d = voxel_3d->key_to_world(max_k_3d);
+            auto min_k_3d = voxel_3d->min_key;
+            auto min_p_3d = voxel_3d->key_to_world(min_k_3d);
+            constexpr double _diff = 0.5;
+            min_p_3d.x() += _diff;
+            min_p_3d.y() += _diff;
+            max_p_3d.x() -= _diff;
+            max_p_3d.y() -= _diff;
+            slope_map = std::make_unique<SlidingVoxelMap<2, float>>(
+                bin_map_->voxel_map_->voxel_size,
+                min_p_3d.head<2>(),
+                max_p_3d.head<2>(),
+                true
+            );
+        }
+
+        slope_map->slide_to(
+            slope_map->world_to_key(voxel_3d->get_center().head<2>()),
+            [&](int idx) {
+
+            }
+        );
+
+        auto occupied_idxs_3d = occ_map_->get_occupied_idx();
         if (occupied_idxs_3d.empty()) {
             return;
         }
@@ -300,18 +320,8 @@ struct RoseMap::Impl {
             pointcloud->point(i) << w3d.cast<double>(), 1.0;
         }
         small_gicp::estimate_normals_tbb(*pointcloud, 20);
-        constexpr double _diff = 0.5;
-        min_p_3d.x() += _diff;
-        min_p_3d.y() += _diff;
-        max_p_3d.x() -= _diff;
-        max_p_3d.y() -= _diff;
-        SlidingVoxelMap<2, float> slope_map(
-            bin_map_->voxel_map_->voxel_size,
-            min_p_3d.head<2>(),
-            max_p_3d.head<2>(),
-            true
-        );
-        std::vector<int> count(slope_map.grid.size(), 0);
+
+        std::vector<int> count(slope_map->grid.size(), 0);
 
         for (size_t i = 0; i < pointcloud->size(); ++i) {
             const auto& pt = pointcloud->point(i);
@@ -319,15 +329,15 @@ struct RoseMap::Impl {
             if (!std::isfinite(n.x()) || !std::isfinite(n.y()) || !std::isfinite(n.z()))
                 continue;
             float cos_theta = std::abs(n.z());
-            int idx2d = slope_map.world_to_index(Eigen::Vector2f(pt.x(), pt.y()));
+            int idx2d = slope_map->world_to_index(Eigen::Vector2f(pt.x(), pt.y()));
             if (idx2d < 0)
                 continue;
-            slope_map.grid[idx2d] += cos_theta;
+            slope_map->grid[idx2d] += cos_theta;
             count[idx2d]++;
         }
         for (auto it = bin_voxel->grid.begin(); it != bin_voxel->grid.end();) {
             auto p = bin_voxel->hash_to_world(it->first);
-            if (slope_map.world_to_index(p) >= 0) {
+            if (slope_map->world_to_index(p) >= 0) {
                 if (!it->second.is_static) {
                     it = bin_voxel->grid.erase(it);
                     continue;
@@ -335,15 +345,19 @@ struct RoseMap::Impl {
             }
             ++it;
         }
-        for (int i = 0; i < slope_map.grid.size(); ++i) {
-            if (count[i] == 0)
-                continue;
-            auto p = slope_map.index_to_world(i);
-            auto it = bin_voxel->get_cell(p);
-            if (it && it->is_static) {
+        for (int i = 0; i < slope_map->grid.size(); ++i) {
+            if (count[i] == 0) {
+                slope_map->grid[i] = 0.0;
                 continue;
             }
-            float avg_cos = slope_map.grid[i] / count[i];
+            auto p = slope_map->index_to_world(i);
+            auto it = bin_voxel->get_cell(p);
+            if (it && it->is_static) {
+                slope_map->grid[i] = 0.0;
+                continue;
+            }
+            float avg_cos = slope_map->grid[i] / count[i];
+            slope_map->grid[i] = 0.0;
             if (avg_cos < cos_thresh_) {
                 bin_voxel->set_cell(p, BinMap::Cell { .is_static = false });
             }

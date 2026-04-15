@@ -1,11 +1,11 @@
 rose_navigation_planner_node:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     rose_planner:
-      robot_radius: 0.2
+      robot_radius: 0.3
       target_frame: map
       use_control_output: true
-      default_wz: 10.14
+      default_wz: 2.14
       odometry_topic: /Odometry
       goal_topic: /rose_goal
       plan_fps: 10.0
@@ -16,8 +16,8 @@ rose_navigation_planner_node:
         safe_radius: 0.1
       traj_opt:
         smooth_weight: 3.0
-        obstacle_weight: 700.0
-        sample_ds: 0.3
+        obstacle_weight: 1000.0
+        sample_ds: 0.2
         expected_speed: 2.5
       mpc:
         control_fps: 60.0
@@ -27,7 +27,7 @@ rose_navigation_planner_node:
         max_speed: 5.5
         max_accel: 30.0
         delay_time: 0.0
-        blind_radius: 0.2
+        blind_radius: 0.5
         Q: [150.0,150.0,0.1,0.1]
         R:  [1.0, 1.0]
         Rd: [50.0,50.0]
@@ -44,7 +44,7 @@ rose_navigation_planner_node:
         log_max: 10.0
         occ_th: 0.01       
         min_shift: 1
-        timeout: 15.5
+        timeout: 3.5
         unknown_is_occupied: false
         use_ray: true
         max_ray_range: 20.0

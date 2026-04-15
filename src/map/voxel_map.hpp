@@ -483,6 +483,9 @@ public:
             }
         }
     }
+    auto get_center() const noexcept {
+        return center;
+    }
 
 public:
     float voxel_size;

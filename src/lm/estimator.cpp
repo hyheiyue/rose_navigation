@@ -86,6 +86,9 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
 
         for (size_t i = r.begin(); i != r.end(); ++i) {
             const auto& p = current_batch.points[i];
+            if (p.count < 1) {
+                continue;
+            }
             const double dt = p.timestamp - current_batch.timestamp;
             const Eigen::Vector3d pt_imu_d = R_LI * p.position.cast<double>() + T_LI;
 

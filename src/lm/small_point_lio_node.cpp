@@ -1,3 +1,4 @@
+#include "backward-cpp/backward.hpp"
 #include "small_point_lio.hpp"
 #include <rclcpp/rclcpp.hpp>
 namespace rose_nav {
@@ -7,6 +8,7 @@ public:
         small_point_lio = std::make_unique<lm::SmallPointLIO>(*this);
     }
     std::unique_ptr<lm::SmallPointLIO> small_point_lio;
+    backward::SignalHandling sh;
 };
 } // namespace rose_nav
 #include "rclcpp_components/register_node_macro.hpp"
