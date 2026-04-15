@@ -63,19 +63,19 @@ public:
     SlidingVoxelMap<3, Cell>::Ptr get_voxel_map() const noexcept;
     struct LogCtx {
         double free_cost = 0;
-
+        double hit_cost = 0;
         double ray_cost = 0;
         double receive_cost = 0;
         int receive_count = 0;
-
+        int hit_count = 0;
         int free_count = 0;
         void reset() {
             free_cost = 0;
-
+            hit_cost = 0;
             ray_cost = 0;
             receive_cost = 0;
             receive_count = 0;
-
+            hit_count = 0;
             free_count = 0;
         }
     };

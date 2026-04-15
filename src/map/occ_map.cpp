@@ -33,6 +33,7 @@ struct OccMap::Impl {
         occupied_pos_.assign(N, -1);
         receive_thread_ = std::thread(std::bind(&OccMap::Impl::receive, this));
         free_thread_ = std::thread(std::bind(&OccMap::Impl::free, this));
+        hit_thread_ = std::thread(std::bind(&OccMap::Impl::hit, this));
         if (params_.use_ray) {
             ray_thread_ = std::thread(std::bind(&OccMap::Impl::ray, this));
         }
@@ -62,7 +63,7 @@ struct OccMap::Impl {
     }
     void receive() noexcept {
         const auto N = voxel_map_->grid_size();
-
+        IdxBuf hit(N);
         std::unique_ptr<IdxBuf> ray_buf;
         if (params_.use_ray) {
             ray_buf = std::make_unique<IdxBuf>(N);
@@ -78,20 +79,17 @@ struct OccMap::Impl {
 
             Ray ray;
             if (ray_buf) {
-                ray_buf->_reset();
                 ray_buf->indices.reserve(pts.size());
                 ray.outmap.reserve(pts.size());
             }
+
+            hit.indices.reserve(pts.size());
             for (const auto& pt: pts) {
                 const VoxelKey<3> k_hit = world_to_key(pt);
 
                 int idx = key_to_index(k_hit);
                 if (idx >= 0) {
-                    auto cell = get_cell(idx);
-                    auto& c = cell.get();
-                    c.log_odds = std::max(c.log_odds + params_.log_hit, params_.log_min);
-                    c.last_update = frame.time;
-                    track_state(idx);
+                    hit.try_push(idx, stamp);
                 }
                 if (ray_buf) {
                     if (idx >= 0) {
@@ -109,13 +107,35 @@ struct OccMap::Impl {
 
                 });
                 ray_queue_.push(std::move(ray));
+                ray_buf->_reset();
             }
+            hit_queue_.push(std::move(hit.make_snap(frame.time)));
+            hit._reset();
             auto end = std::chrono::steady_clock::now();
             log_ctx_.receive_cost += std::chrono::duration<double, std::milli>(end - start).count();
             log_ctx_.receive_count++;
         }
     }
+    void hit() noexcept {
+        while (rclcpp::ok()) {
+            IdxSnap<double> hit;
+            hit_queue_.wait_and_pop(hit);
+            auto start = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < hit.indices.size(); ++i) {
+                int idx = hit.indices[i];
+                auto cell = get_cell(idx);
+                auto& c = cell.get();
 
+                c.log_odds = std::max(c.log_odds + params_.log_hit * hit.count[i], params_.log_min);
+                c.last_update = hit.ctx;
+                track_state(idx);
+            }
+
+            auto end = std::chrono::steady_clock::now();
+            log_ctx_.hit_cost += std::chrono::duration<double, std::milli>(end - start).count();
+            log_ctx_.hit_count += hit.indices.size();
+        }
+    }
     void free() noexcept {
         while (rclcpp::ok()) {
             IdxSnap<double> free;
@@ -132,22 +152,6 @@ struct OccMap::Impl {
                 c.last_update = free.ctx;
                 track_state(idx);
             }
-            // tbb::parallel_for(
-            //     size_t(0),
-            //     free.indices.size(),
-            //     [&](size_t i) {
-            //         int idx = free.indices[i];
-
-            //         auto cell = get_cell(idx);
-            //         auto& c = cell.get();
-
-            //         c.log_odds =
-            //             std::min(c.log_odds + params_.log_free * free.count[i], params_.log_max);
-            //         c.last_update = free.ctx;
-            //         track_state(idx);
-            //     },
-            //     tbb::auto_partitioner()
-            // );
             auto end = std::chrono::steady_clock::now();
             log_ctx_.free_cost += std::chrono::duration<double, std::milli>(end - start).count();
             log_ctx_.free_count += free.indices.size();
@@ -238,9 +242,6 @@ struct OccMap::Impl {
                 tbb::auto_partitioner()
             );
 
-            free._reset();
-            free.indices.reserve(N);
-
             for (auto& local: tls) {
                 for (size_t i = 0; i < local.size(); ++i) {
                     free.try_push(local.idx[i], local.cnt[i], stamp);
@@ -248,6 +249,8 @@ struct OccMap::Impl {
             }
 
             free_queue_.push(std::move(free.make_snap(ray.inmap.ctx.time)));
+            free._reset();
+            free.indices.reserve(N);
 
             auto end = std::chrono::steady_clock::now();
             log_ctx_.ray_cost +=
@@ -493,6 +496,9 @@ struct OccMap::Impl {
             occupied_buffer_idx_.push_back(idx);
         }
     }
+    mutable std::mutex occupied_mutex_;
+    std::vector<int> occupied_buffer_idx_;
+    std::vector<int> occupied_pos_;
     std::vector<int> get_occupied_idx() const noexcept {
         std::lock_guard<std::mutex> lock(occupied_mutex_);
         return occupied_buffer_idx_;
@@ -502,11 +508,9 @@ struct OccMap::Impl {
     }
     SlidingVoxelMap<3, Cell>::Ptr voxel_map_;
     std::vector<std::unique_ptr<std::mutex>> cell_mutexes_;
-    mutable std::mutex occupied_mutex_;
-    std::vector<int> occupied_buffer_idx_;
-    std::vector<int> occupied_pos_;
+
     double now_;
-    LockQueue<IdxSnap<double>> free_queue_;
+    LockQueue<IdxSnap<double>> free_queue_, hit_queue_;
     struct RayCtx {
         double time;
         VoxelKey<3> sensor_key;
@@ -517,7 +521,7 @@ struct OccMap::Impl {
     };
     LockQueue<Ray> ray_queue_;
     LockQueue<Frame> frame_queue_ { 10 };
-    std::thread receive_thread_, free_thread_, ray_thread_;
+    std::thread receive_thread_, hit_thread_, free_thread_, ray_thread_;
 };
 OccMap::OccMap(const ParamsNode& config) {
     _impl = std::make_unique<Impl>(config);

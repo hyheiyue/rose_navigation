@@ -194,6 +194,8 @@ struct RoseMap::Impl {
                                     << "ms"
                                     << " free: " << log_ctx.free_count
                                     << " cost: " << log_ctx.free_cost << "ms"
+                                    << " hit: " << log_ctx.hit_count
+                                    << " cost: " << log_ctx.hit_cost << "ms"
                                     << " ray: cost: " << log_ctx.ray_cost << "ms"
                                     << " up: " << update_count << " update: " << update_cost << "ms"
                     );

@@ -37,14 +37,14 @@ configure_file(
     ${CMAKE_BINARY_DIR}/src/param_deliver.h            
     @ONLY
 )
-file(GLOB_RECURSE UTILS_SOURCE src/utils/*.cpp 3rdparty/*.c 3rdparty/*.cpp)
-ament_auto_add_library(${PROJECT_NAME}_utils SHARED ${UTILS_SOURCE})
-target_include_directories(${PROJECT_NAME}_utils PUBLIC
+file(GLOB_RECURSE SOURCE src/*.cpp 3rdparty/*.c 3rdparty/*.cpp)
+ament_auto_add_library(${PROJECT_NAME} SHARED ${SOURCE})
+target_include_directories(${PROJECT_NAME} PUBLIC
     3rdparty
     src
     ${CMAKE_BINARY_DIR}/src
 )
-target_link_libraries(${PROJECT_NAME}_utils
+target_link_libraries(${PROJECT_NAME}
     Eigen3::Eigen
     yaml-cpp
     TBB::tbb
@@ -53,7 +53,7 @@ target_link_libraries(${PROJECT_NAME}_utils
     ${OSQP_LIB_PATH}
     
 )
-ament_target_dependencies(${PROJECT_NAME}_utils
+ament_target_dependencies(${PROJECT_NAME}
     rclcpp
     rclcpp_components
     rclpy
@@ -66,35 +66,17 @@ ament_target_dependencies(${PROJECT_NAME}_utils
     visualization_msgs
     nav2_msgs
 )
-file(GLOB_RECURSE LM_SOURCE src/lm/*.cpp)
-ament_auto_add_library(${PROJECT_NAME}_lm SHARED ${LM_SOURCE})
-target_link_libraries( ${PROJECT_NAME}_lm
-    ${PROJECT_NAME}_utils
-    
-)
 
-file(GLOB_RECURSE MAP_SOURCE src/map/*.cpp)
-ament_auto_add_library(${PROJECT_NAME}_map SHARED ${MAP_SOURCE})
-target_link_libraries( ${PROJECT_NAME}_map
-    ${PROJECT_NAME}_utils
-    
-)
-file(GLOB_RECURSE PLANNER_SOURCE src/planner/*.cpp)
-ament_auto_add_library(${PROJECT_NAME}_planner SHARED ${PLANNER_SOURCE})
-target_link_libraries( ${PROJECT_NAME}_planner
-    ${PROJECT_NAME}_utils
-    ${PROJECT_NAME}_map 
-)
-rclcpp_components_register_node(${PROJECT_NAME}_lm
+rclcpp_components_register_node(${PROJECT_NAME}
     PLUGIN "rose_nav::SmallPointLioNode"
     EXECUTABLE ${PROJECT_NAME}_lm_node
 )
-rclcpp_components_register_node(${PROJECT_NAME}_map
+rclcpp_components_register_node(${PROJECT_NAME}
     PLUGIN "rose_nav::RoseMapNode"
     EXECUTABLE ${PROJECT_NAME}_map_node
 )
 
-rclcpp_components_register_node(${PROJECT_NAME}_planner
+rclcpp_components_register_node(${PROJECT_NAME}
     PLUGIN "rose_nav::RosePlannerNode"
     EXECUTABLE ${PROJECT_NAME}_planner_node
 )

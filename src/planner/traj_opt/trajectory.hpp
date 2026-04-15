@@ -28,6 +28,7 @@
 
 #include <Eigen/Eigen>
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <iostream>
@@ -606,63 +607,21 @@ public:
         }
         return feasible;
     }
-    inline double getTimeByPos(const Eigen::Vector2d& pos, double eps = 1e-3) const {
-        const double phi = 0.6180339887498949;
-
-        double t_global = 0.0;
-
-        for (int i = 0; i < getPieceNum(); i++) {
-            double T = pieces[i].getDuration();
-
-            double left = 0.0;
-            double right = T;
-            double c = right - phi * (right - left);
-            double d = left + phi * (right - left);
-
-            double tau_best = -1.0;
-            double dist_best = std::numeric_limits<double>::infinity();
-
-            Eigen::Vector2d pc = pieces[i].getPos(c);
-            Eigen::Vector2d pd = pieces[i].getPos(d);
-            double fc = (pc - pos).norm();
-            double fd = (pd - pos).norm();
-
-            for (int iter = 0; iter < 30; iter++) {
-                if (fc < dist_best) {
-                    dist_best = fc;
-                    tau_best = c;
-                }
-                if (fd < dist_best) {
-                    dist_best = fd;
-                    tau_best = d;
-                }
-                if (fc > fd) {
-                    left = c;
-                    c = d;
-                    fc = fd;
-
-                    d = left + phi * (right - left);
-                    pd = pieces[i].getPos(d);
-                    fd = (pd - pos).norm();
-                } else {
-                    right = d;
-                    d = c;
-                    fd = fc;
-
-                    c = right - phi * (right - left);
-                    pc = pieces[i].getPos(c);
-                    fc = (pc - pos).norm();
-                }
+    inline double getTimeByPos(const Eigen::Vector2d& pos, double smaple_dt = 0.05) const {
+        double best_t = 0.0;
+        double t = 0.0;
+        double total_duration = getTotalDuration();
+        double min_dis = std::numeric_limits<double>::infinity();
+        while (t <= total_duration) {
+            auto p = getPos(t);
+            auto dis = (p - pos).norm();
+            if (dis < min_dis) {
+                min_dis = dis;
+                best_t = t;
             }
-
-            if (dist_best < eps && tau_best >= 0.0) {
-                return t_global + tau_best;
-            }
-
-            t_global += T;
+            t += smaple_dt;
         }
-
-        return -1.0;
+        return best_t;
     }
 
     inline std::vector<Eigen::Vector2d>

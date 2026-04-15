@@ -351,9 +351,11 @@ struct RosePlanner::Impl {
                 auto removed = remove_old_path();
                 auto unsafe_points = check_safe_path(removed);
                 if (!unsafe_points.empty()) {
+                    current_path_ = removed;
                     local_replan(unsafe_points, goal_pos);
                 } else {
-                    double t = 0.0;
+                    double start_t = current_traj_.getTimeByPos(current.pos);
+                    double t = start_t;
                     std::vector<Eigen::Vector2d> traj_path;
                     constexpr double horzien = 3.0;
                     while (t < horzien) {
@@ -365,7 +367,8 @@ struct RosePlanner::Impl {
                     }
                     unsafe_points = check_safe_path(traj_path);
                     if (!unsafe_points.empty()) {
-                        resample_and_opt(removed, std::make_pair(0.0, horzien));
+                        current_path_ = removed;
+                        resample_and_opt(removed, std::make_pair(start_t, horzien));
                     }
                 }
                 if (fsm_ == FSMSTATE::WAIT_GOAL) {
@@ -537,15 +540,13 @@ struct RosePlanner::Impl {
         auto current = robo_->get_now_state();
 
         int best_target_index = -1;
-        double best_dist2 = std::numeric_limits<double>::infinity();
+        double best_dist = std::numeric_limits<double>::infinity();
 
         for (int i = 0; i < r.size(); ++i) {
-            double dx = r[i].x() - current.pos.x();
-            double dy = r[i].y() - current.pos.y();
-            double dist2 = dx * dx + dy * dy;
+            auto dis = (r[i] - current.pos).norm();
 
-            if (dist2 < best_dist2) {
-                best_dist2 = dist2;
+            if (dis < best_dist) {
+                best_dist = dis;
                 best_target_index = i;
             }
         }
