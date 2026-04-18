@@ -2,6 +2,8 @@
 #include "lbfgs.hpp"
 #include "planner/common.hpp"
 #include "planner/traj_opt/minco.hpp"
+#include <Eigen/src/Core/Matrix.h>
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <rclcpp/logger.hpp>
@@ -102,9 +104,68 @@ struct TrajOpt::Impl {
         const std::vector<Eigen::Vector2d>& path,
         const RoboState& now,
         bool use_opt,
-        std::optional<std::pair<double, double>> some_no_opt = std::nullopt
+        std::optional<std::pair<int, int>> some_no_opt = std::nullopt
     ) noexcept {
-        sampled_path_ = SampleUniform::sample_uniform(path, params_.sample_ds);
+        int idx0 = 0;
+        int idx1 = 0;
+
+        if (some_no_opt) {
+            int no_opt_start = some_no_opt->first;
+            int no_opt_end = some_no_opt->second;
+
+            // 修正：正确夹紧到有效范围
+            no_opt_start = std::max(0, no_opt_start);
+            // 注意：end 最大为 path.size()-2，保证 mid 至少包含两个点且不越界
+            no_opt_end = std::min(static_cast<int>(path.size()) - 2, no_opt_end);
+
+            // 分段构造（允许轻微重叠，后续由 append_no_duplicate 处理）
+            std::vector<Eigen::Vector2d> front(path.begin(), path.begin() + no_opt_start + 1);
+            std::vector<Eigen::Vector2d> mid(
+                path.begin() + no_opt_start,
+                path.begin() + no_opt_end + 1
+            );
+            std::vector<Eigen::Vector2d> back(path.begin() + no_opt_end, path.end());
+
+            // 对各段分别均匀采样
+            auto sampled_front = SampleUniform::sample_uniform(front, params_.sample_ds);
+            auto sampled_mid = SampleUniform::sample_uniform(mid, params_.sample_ds);
+            auto sampled_back = SampleUniform::sample_uniform(back, params_.sample_ds);
+
+            sampled_path_.clear();
+
+            // 拼接函数：仅当相邻段首点间距超过阈值时才保留前一段末点，避免过近重复
+            auto append_no_duplicate = [&](std::vector<Eigen::Vector2d>& dst,
+                                           const std::vector<Eigen::Vector2d>& src) {
+                if (src.empty())
+                    return;
+                if (dst.empty() || (dst.back() - src.front()).norm() > params_.sample_ds) {
+                    dst.push_back(src.front());
+                }
+                for (size_t i = 1; i < src.size(); ++i) {
+                    dst.push_back(src[i]);
+                }
+            };
+
+            append_no_duplicate(sampled_path_, sampled_front);
+            append_no_duplicate(sampled_path_, sampled_mid);
+            append_no_duplicate(sampled_path_, sampled_back);
+
+            // 计算用于标记不优化区间的控制点索引（基于采样后大小）
+            if (sampled_front.size() >= 2) {
+                idx0 = static_cast<int>(sampled_front.size()) - 1;
+            } else {
+                idx0 = 0;
+            }
+
+            if (sampled_mid.size() >= 2) {
+                idx1 = idx0 + static_cast<int>(sampled_mid.size()) - 2;
+            } else {
+                idx1 = idx0;
+            }
+
+        } else {
+            sampled_path_ = SampleUniform::sample_uniform(path, params_.sample_ds);
+        }
 
         if (sampled_path_.size() < 5) {
             RCLCPP_ERROR_STREAM(
@@ -119,8 +180,10 @@ struct TrajOpt::Impl {
 
         Eigen::Matrix<double, 2, 3> tail_state;
         tail_state << sampled_path_.back(), Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
+
         const int piece_num = sampled_path_.size() - 1;
         piece_num_ = piece_num;
+
         const auto w_smooth = params_.smooth_weight;
 
         minco_
@@ -133,19 +196,15 @@ struct TrajOpt::Impl {
         std::vector<char> is_no_opt(ctrl_num, false);
 
         if (some_no_opt) {
-            double t0 = some_no_opt->first;
-            double t1 = some_no_opt->second;
-
-            int idx0 = std::floor(t0 / dt);
-            int idx1 = std::ceil(t1 / dt);
-
-            idx0 = std::max(0, idx0);
-            idx1 = std::min(ctrl_num, idx1);
-
-            for (int i = idx0; i < idx1; ++i) {
-                is_no_opt[i] = true;
+            idx0 = std::clamp(idx0, 0, ctrl_num);
+            idx1 = std::clamp(idx1, 0, ctrl_num);
+            if (idx0 != idx1) {
+                for (int i = idx0; i < idx1; ++i) {
+                    is_no_opt[i] = true;
+                }
             }
         }
+
         opt_indices_.clear();
         for (int i = 0; i < ctrl_num; ++i) {
             if (!is_no_opt[i]) {
@@ -171,7 +230,7 @@ struct TrajOpt::Impl {
         double min_cost = 0.0;
         int ret = 0;
 
-        if (use_opt) {
+        if (use_opt && opt_num > 0) {
             ret = lbfgs::lbfgs_optimize(
                 x_opt,
                 min_cost,
@@ -185,10 +244,12 @@ struct TrajOpt::Impl {
 
         Eigen::Matrix2Xd in_ps(2, ctrl_num);
         Eigen::VectorXd full_x(2 * ctrl_num);
+
         for (int i = 0; i < ctrl_num; ++i) {
             full_x(i) = sampled_path_[i + 1].x();
             full_x(i + ctrl_num) = sampled_path_[i + 1].y();
         }
+
         for (int k = 0; k < opt_num; ++k) {
             int i = opt_indices_[k];
             full_x(i) = x_opt(k);
@@ -203,8 +264,7 @@ struct TrajOpt::Impl {
         TrajType final_traj;
         minco_.getTrajectory(final_traj);
 
-        if (ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH) {
-        } else {
+        if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH)) {
             RCLCPP_ERROR_STREAM(
                 rclcpp::get_logger("rose_nav:planner"),
                 "TrajOpt FAIL: " << lbfgs::lbfgs_strerror(ret)
@@ -261,8 +321,6 @@ struct TrajOpt::Impl {
             energyT_grad
         );
 
-        Eigen::Matrix2Xd grad_by_points2;
-        Eigen::VectorXd grad_by_times2;
         Eigen::Matrix2Xd gradp = energy_grad;
 
         cost_val += energy;
@@ -484,7 +542,7 @@ std::optional<TrajType> TrajOpt::optimize(
     const std::vector<Eigen::Vector2d>& path,
     const RoboState& now,
     bool use_opt,
-    std::optional<std::pair<double, double>> some_no_opt
+    std::optional<std::pair<int, int>> some_no_opt
 ) {
     return _impl->optimize(path, now, use_opt, some_no_opt);
 }

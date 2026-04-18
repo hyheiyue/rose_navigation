@@ -55,10 +55,15 @@ struct LMPC::Impl {
         return rose_map_->esdf()->get_esdf(pos.cast<float>());
     }
     bool get_re(const int T_in, double dt_in) {
+    ws:
         P_.clear();
         P_.reserve(T_in);
 
-        double t_cur = traj_.getTimeByPos(now_state_w_.pos, 0.5);
+        auto t_cur_and_dis = traj_.getTimeByPos(now_state_w_.pos);
+        if (t_cur_and_dis.second > 0.5) {
+            return false;
+        }
+        double t_cur = t_cur_and_dis.first;
         if (t_cur < 0.0)
             t_cur = 0.0;
         double t = t_cur + dt_in + params_.delay_time;

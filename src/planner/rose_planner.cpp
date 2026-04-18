@@ -8,10 +8,12 @@
 #include "utils/rclcpp_parameter_node.hpp"
 #include <Eigen/src/Core/Matrix.h>
 #include <Eigen/src/Geometry/Transform.h>
+#include <algorithm>
 #include <memory>
 #include <nav_msgs/msg/path.hpp>
 #include <optional>
 #include <rclcpp/logger.hpp>
+#include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <string>
@@ -233,7 +235,7 @@ struct RosePlanner::Impl {
         now_state_marker.pose.position.z = 0.0;
         now_state_marker_pub_->publish(now_state_marker);
         if (!has_traj_) {
-            if (fsm_ == FSMSTATE::SEARCH_PATH && fsm_ == FSMSTATE::REPLAN
+            if ((fsm_ == FSMSTATE::SEARCH_PATH || fsm_ == FSMSTATE::REPLAN)
                 && params_.use_control_output) {
                 geometry_msgs::msg::Twist cmd;
                 cmd.linear.x = 0.0;
@@ -347,19 +349,31 @@ struct RosePlanner::Impl {
                     }
                     break;
                 }
-                remove_old_traj();
+                auto t_and_dis = current_traj_.getTimeByPos(current.pos);
+                double now_t_in_traj = t_and_dis.first;
+                if (t_and_dis.second > 0.5) {
+                    RCLCPP_WARN(
+                        rclcpp::get_logger("rose_nav:planner"),
+                        "now in traj too far %.2f",
+                        t_and_dis.second
+                    );
+                    fsm_ = FSMSTATE::SEARCH_PATH;
+                    break;
+                }
                 auto removed = remove_old_path();
                 auto unsafe_points = check_safe_path(removed);
                 if (!unsafe_points.empty()) {
+                    has_traj_ = false;
                     current_path_ = removed;
                     local_replan(unsafe_points, goal_pos);
                 } else {
-                    double start_t = current_traj_.getTimeByPos(current.pos);
+                    double start_t = now_t_in_traj;
                     double t = start_t;
                     std::vector<Eigen::Vector2d> traj_path;
-                    constexpr double horzien = 3.0;
-                    while (t < horzien) {
-                        if (t >= current_traj_.getTotalDuration()) {
+                    constexpr double horzien = 4.0;
+                    auto traj_duration = current_traj_.getTotalDuration();
+                    while (t < start_t + horzien) {
+                        if (t >= traj_duration) {
                             break;
                         }
                         traj_path.push_back(current_traj_.getPos(t));
@@ -367,8 +381,11 @@ struct RosePlanner::Impl {
                     }
                     unsafe_points = check_safe_path(traj_path);
                     if (!unsafe_points.empty()) {
+                        has_traj_ = false;
                         current_path_ = removed;
-                        resample_and_opt(removed, std::make_pair(start_t, horzien));
+                        int no_opt_end =
+                            removed.size() * (horzien / std::min((traj_duration - start_t), 0.1));
+                        resample_and_opt(removed, std::make_pair(0, no_opt_end));
                     }
                 }
                 if (fsm_ == FSMSTATE::WAIT_GOAL) {
@@ -474,7 +491,7 @@ struct RosePlanner::Impl {
         if (next_idx >= N) {
             RCLCPP_WARN(
                 rclcpp::get_logger("rose_nav:planner"),
-                "Local replan end is last point, skipping."
+                "Local replan end is last point"
             );
             fsm_ = FSMSTATE::SEARCH_PATH;
             return;
@@ -505,7 +522,7 @@ struct RosePlanner::Impl {
         new_raw_path.insert(new_raw_path.end(), path_after.begin(), path_after.end());
 
         current_path_ = new_raw_path;
-        resample_and_opt(current_path_);
+        resample_and_opt(current_path_, std::make_pair(0, local_path.size() - 1));
     }
     std::pair<std::vector<Eigen::Vector2d>, AStar::SearchState>
     search(const Eigen::Vector2d& start, const Eigen::Vector2d& goal) {
@@ -523,15 +540,6 @@ struct RosePlanner::Impl {
         }
 
         return std::make_pair(path, search_state);
-    }
-    void remove_old_traj() {
-        auto current = robo_->get_now_state();
-        double t_cur = current_traj_.getTimeByPos(current.pos, 0.5);
-        if (t_cur < 0) {
-            fsm_ = FSMSTATE::SEARCH_PATH;
-            return;
-        }
-        current_traj_.truncateBeforeTime(t_cur);
     }
     std::vector<Eigen::Vector2d> remove_old_path() {
         if (current_path_.empty())
@@ -553,20 +561,14 @@ struct RosePlanner::Impl {
         if (best_target_index > 0) {
             r.erase(r.begin(), r.begin() + best_target_index);
         }
+        r.front() = current.pos;
+
         return r;
     }
-
-    void resample_and_opt(
-        const std::vector<Eigen::Vector2d>& path,
-        std::optional<std::pair<double, double>> some_no_opt = std::nullopt
-    ) noexcept {
+    void pub_raw_path(const std::vector<Eigen::Vector2d>& path) {
         nav_msgs::msg::Path raw_path_msg;
         raw_path_msg.header.stamp = node_->now();
         raw_path_msg.header.frame_id = params_.target_frame;
-        nav_msgs::msg::Path opt_path_msg;
-        opt_path_msg.header.stamp = node_->now();
-        opt_path_msg.header.frame_id = params_.target_frame;
-        auto current = robo_->get_now_state();
         if (raw_path_pub_->get_subscription_count() > 0) {
             for (int i = 0; i < (int)path.size(); i++) {
                 geometry_msgs::msg::PoseStamped pose_msg;
@@ -579,6 +581,17 @@ struct RosePlanner::Impl {
             }
             raw_path_pub_->publish(raw_path_msg);
         }
+    }
+
+    void resample_and_opt(
+        const std::vector<Eigen::Vector2d>& path,
+        std::optional<std::pair<int, int>> some_no_opt = std::nullopt
+    ) noexcept {
+        nav_msgs::msg::Path opt_path_msg;
+        opt_path_msg.header.stamp = node_->now();
+        opt_path_msg.header.frame_id = params_.target_frame;
+        auto current = robo_->get_now_state();
+        pub_raw_path(path);
         auto opt_traj_opt = traj_opt_->optimize(path, current, USE_OPT, some_no_opt);
 
         if (opt_traj_opt) {
@@ -645,7 +658,8 @@ struct RosePlanner::Impl {
                 opt_marker_pub_->publish(marker);
             }
         } else {
-            fsm_ = FSMSTATE::SEARCH_PATH;
+            has_traj_ = false;
+            fsm_ = FSMSTATE::WAIT_GOAL;
         }
     }
     rclcpp::Node* node_;

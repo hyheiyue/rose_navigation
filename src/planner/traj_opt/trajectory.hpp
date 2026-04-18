@@ -32,6 +32,7 @@
 #include <cfloat>
 #include <cmath>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 template<int D, int Freedom>
@@ -607,7 +608,8 @@ public:
         }
         return feasible;
     }
-    inline double getTimeByPos(const Eigen::Vector2d& pos, double smaple_dt = 0.05) const {
+    inline std::pair<double, double>
+    getTimeByPos(const Eigen::Vector2d& pos, double smaple_dt = 0.05) const {
         double best_t = 0.0;
         double t = 0.0;
         double total_duration = getTotalDuration();
@@ -621,7 +623,7 @@ public:
             }
             t += smaple_dt;
         }
-        return best_t;
+        return std::make_pair(best_t, min_dis);
     }
 
     inline std::vector<Eigen::Vector2d>
