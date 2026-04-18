@@ -1,6 +1,7 @@
 #include "trajectory_opt.hpp"
 #include "lbfgs.hpp"
 #include "planner/common.hpp"
+#include "planner/traj.hpp"
 #include "planner/traj_opt/minco.hpp"
 #include <Eigen/src/Core/Matrix.h>
 #include <algorithm>
@@ -12,78 +13,12 @@
 #include <vector>
 namespace rose_nav::planner {
 struct TrajOpt::Impl {
-    class SampleUniform {
-    public:
-        static std::vector<Eigen::Vector2d>
-        sample_uniform(const std::vector<Eigen::Vector2d>& path, double sample_ds) noexcept {
-            if (path.size() < 2)
-                return {};
-
-            auto s_map = compute_arc_lengths(path);
-
-            double s_total = s_map.back();
-
-            std::vector<Eigen::Vector2d> traj;
-
-            for (double s = 0.0; s <= s_total; s += sample_ds) {
-                Eigen::Vector2d p = interpolate_path(path, s_map, s);
-                traj.push_back({ p });
-            }
-
-            traj.push_back({ path.back() });
-
-            return traj;
-        }
-
-    public:
-        static std::vector<double> compute_arc_lengths(const std::vector<Eigen::Vector2d>& path
-        ) noexcept {
-            std::vector<double> s(path.size(), 0.0);
-
-            for (size_t i = 1; i < path.size(); ++i)
-                s[i] = s[i - 1] + (path[i] - path[i - 1]).norm();
-
-            return s;
-        }
-
-    private:
-        static Eigen::Vector2d interpolate_path(
-            const std::vector<Eigen::Vector2d>& path,
-            const std::vector<double>& s,
-            double s_q
-        ) noexcept {
-            if (s_q <= s.front())
-                return path.front();
-
-            if (s_q >= s.back())
-                return path.back();
-
-            auto it = std::lower_bound(s.begin(), s.end(), s_q);
-
-            int i = std::distance(s.begin(), it);
-
-            i = std::clamp(i, 1, static_cast<int>(s.size()) - 1);
-
-            double ds = s[i] - s[i - 1];
-
-            if (ds < 1e-6)
-                return path[i];
-
-            double r = (s_q - s[i - 1]) / ds;
-
-            return path[i - 1] * (1.0 - r) + path[i] * r;
-        }
-    };
     struct Params {
         double smooth_weight;
         double obstacle_weight;
-        double sample_ds;
-        double expected_speed;
         void load(const ParamsNode& config) {
             smooth_weight = config.declare<double>("smooth_weight");
             obstacle_weight = config.declare<double>("obstacle_weight");
-            sample_ds = config.declare<double>("sample_ds");
-            expected_speed = config.declare<double>("expected_speed");
         }
     } params_;
     Impl(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
@@ -98,250 +33,6 @@ struct TrajOpt::Impl {
         lbfgs_params_.max_linesearch = 32;
         lbfgs_params_.f_dec_coeff = 1e-4;
         lbfgs_params_.s_curv_coeff = 0.9;
-    }
-
-    std::optional<TrajType> optimize(
-        const std::vector<Eigen::Vector2d>& path,
-        const RoboState& now,
-        bool use_opt,
-        std::optional<std::pair<int, int>> some_no_opt = std::nullopt
-    ) noexcept {
-        int idx0 = 0;
-        int idx1 = 0;
-
-        if (some_no_opt) {
-            int no_opt_start = some_no_opt->first;
-            int no_opt_end = some_no_opt->second;
-
-            // 修正：正确夹紧到有效范围
-            no_opt_start = std::max(0, no_opt_start);
-            // 注意：end 最大为 path.size()-2，保证 mid 至少包含两个点且不越界
-            no_opt_end = std::min(static_cast<int>(path.size()) - 2, no_opt_end);
-
-            // 分段构造（允许轻微重叠，后续由 append_no_duplicate 处理）
-            std::vector<Eigen::Vector2d> front(path.begin(), path.begin() + no_opt_start + 1);
-            std::vector<Eigen::Vector2d> mid(
-                path.begin() + no_opt_start,
-                path.begin() + no_opt_end + 1
-            );
-            std::vector<Eigen::Vector2d> back(path.begin() + no_opt_end, path.end());
-
-            // 对各段分别均匀采样
-            auto sampled_front = SampleUniform::sample_uniform(front, params_.sample_ds);
-            auto sampled_mid = SampleUniform::sample_uniform(mid, params_.sample_ds);
-            auto sampled_back = SampleUniform::sample_uniform(back, params_.sample_ds);
-
-            sampled_path_.clear();
-
-            // 拼接函数：仅当相邻段首点间距超过阈值时才保留前一段末点，避免过近重复
-            auto append_no_duplicate = [&](std::vector<Eigen::Vector2d>& dst,
-                                           const std::vector<Eigen::Vector2d>& src) {
-                if (src.empty())
-                    return;
-                if (dst.empty() || (dst.back() - src.front()).norm() > params_.sample_ds) {
-                    dst.push_back(src.front());
-                }
-                for (size_t i = 1; i < src.size(); ++i) {
-                    dst.push_back(src[i]);
-                }
-            };
-
-            append_no_duplicate(sampled_path_, sampled_front);
-            append_no_duplicate(sampled_path_, sampled_mid);
-            append_no_duplicate(sampled_path_, sampled_back);
-
-            // 计算用于标记不优化区间的控制点索引（基于采样后大小）
-            if (sampled_front.size() >= 2) {
-                idx0 = static_cast<int>(sampled_front.size()) - 1;
-            } else {
-                idx0 = 0;
-            }
-
-            if (sampled_mid.size() >= 2) {
-                idx1 = idx0 + static_cast<int>(sampled_mid.size()) - 2;
-            } else {
-                idx1 = idx0;
-            }
-
-        } else {
-            sampled_path_ = SampleUniform::sample_uniform(path, params_.sample_ds);
-        }
-
-        if (sampled_path_.size() < 5) {
-            RCLCPP_ERROR_STREAM(
-                rclcpp::get_logger("rose_nav:planner"),
-                "sampled too small size: " << sampled_path_.size()
-            );
-            return std::nullopt;
-        }
-
-        Eigen::Matrix<double, 2, 3> head_state;
-        head_state << now.pos, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
-
-        Eigen::Matrix<double, 2, 3> tail_state;
-        tail_state << sampled_path_.back(), Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
-
-        const int piece_num = sampled_path_.size() - 1;
-        piece_num_ = piece_num;
-
-        const auto w_smooth = params_.smooth_weight;
-
-        minco_
-            .setConditions(head_state, tail_state, piece_num, Eigen::Vector2d(w_smooth, w_smooth));
-
-        const int ctrl_num = piece_num - 1;
-
-        double dt = params_.sample_ds / params_.expected_speed;
-
-        std::vector<char> is_no_opt(ctrl_num, false);
-
-        if (some_no_opt) {
-            idx0 = std::clamp(idx0, 0, ctrl_num);
-            idx1 = std::clamp(idx1, 0, ctrl_num);
-            if (idx0 != idx1) {
-                for (int i = idx0; i < idx1; ++i) {
-                    is_no_opt[i] = true;
-                }
-            }
-        }
-
-        opt_indices_.clear();
-        for (int i = 0; i < ctrl_num; ++i) {
-            if (!is_no_opt[i]) {
-                opt_indices_.push_back(i);
-            }
-        }
-
-        const int opt_num = opt_indices_.size();
-
-        Eigen::VectorXd x_opt(2 * opt_num);
-
-        for (int k = 0; k < opt_num; ++k) {
-            int i = opt_indices_[k];
-            x_opt(k) = sampled_path_[i + 1].x();
-            x_opt(k + opt_num) = sampled_path_[i + 1].y();
-        }
-
-        in_times_.resize(piece_num);
-        for (int i = 0; i < piece_num; ++i) {
-            in_times_(i) = dt;
-        }
-
-        double min_cost = 0.0;
-        int ret = 0;
-
-        if (use_opt && opt_num > 0) {
-            ret = lbfgs::lbfgs_optimize(
-                x_opt,
-                min_cost,
-                &TrajOpt::Impl::cost,
-                nullptr,
-                nullptr,
-                this,
-                lbfgs_params_
-            );
-        }
-
-        Eigen::Matrix2Xd in_ps(2, ctrl_num);
-        Eigen::VectorXd full_x(2 * ctrl_num);
-
-        for (int i = 0; i < ctrl_num; ++i) {
-            full_x(i) = sampled_path_[i + 1].x();
-            full_x(i + ctrl_num) = sampled_path_[i + 1].y();
-        }
-
-        for (int k = 0; k < opt_num; ++k) {
-            int i = opt_indices_[k];
-            full_x(i) = x_opt(k);
-            full_x(i + ctrl_num) = x_opt(k + opt_num);
-        }
-
-        in_ps.row(0) = full_x.head(ctrl_num).transpose();
-        in_ps.row(1) = full_x.segment(ctrl_num, ctrl_num).transpose();
-
-        minco_.setParameters(in_ps, in_times_);
-
-        TrajType final_traj;
-        minco_.getTrajectory(final_traj);
-
-        if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH)) {
-            RCLCPP_ERROR_STREAM(
-                rclcpp::get_logger("rose_nav:planner"),
-                "TrajOpt FAIL: " << lbfgs::lbfgs_strerror(ret)
-            );
-        }
-
-        return std::make_optional(std::move(final_traj));
-    }
-    static double cost(void* ptr, const Eigen::VectorXd& x, Eigen::VectorXd& g) noexcept {
-        auto* instance = static_cast<TrajOpt::Impl*>(ptr);
-
-        const int ctrl_num = instance->piece_num_ - 1;
-        const int opt_num = instance->opt_indices_.size();
-
-        double cost_val = 0.0;
-
-        Eigen::VectorXd full_x(2 * ctrl_num);
-
-        for (int i = 0; i < ctrl_num; ++i) {
-            full_x(i) = instance->sampled_path_[i + 1].x();
-            full_x(i + ctrl_num) = instance->sampled_path_[i + 1].y();
-        }
-
-        for (int k = 0; k < opt_num; ++k) {
-            int i = instance->opt_indices_[k];
-            full_x(i) = x(k);
-            full_x(i + ctrl_num) = x(k + opt_num);
-        }
-
-        Eigen::Matrix2Xd in_ps(2, ctrl_num);
-        in_ps.row(0) = full_x.head(ctrl_num).transpose();
-        in_ps.row(1) = full_x.segment(ctrl_num, ctrl_num).transpose();
-
-        instance->minco_.setParameters(in_ps, instance->in_times_);
-
-        double energy = 0.0;
-
-        Eigen::Matrix2Xd energy_grad = Eigen::Matrix2Xd::Zero(2, ctrl_num);
-        Eigen::VectorXd energyT_grad = Eigen::VectorXd::Zero(ctrl_num + 1);
-
-        Eigen::Matrix2Xd grad_by_points;
-        Eigen::VectorXd grad_by_times;
-        Eigen::MatrixX2d partial_grad_by_coeffs;
-        Eigen::VectorXd partial_grad_by_times;
-
-        instance->minco_.getEnergyPartialGradByCoeffs(partial_grad_by_coeffs);
-        instance->minco_.getEnergyPartialGradByTimes(partial_grad_by_times);
-        instance->minco_.getEnergy(energy);
-
-        instance->minco_.propogateGrad(
-            partial_grad_by_coeffs,
-            partial_grad_by_times,
-            energy_grad,
-            energyT_grad
-        );
-
-        Eigen::Matrix2Xd gradp = energy_grad;
-
-        cost_val += energy;
-        cost_val += instance->attach_penalty_functional(in_ps, gradp);
-
-        Eigen::VectorXd g_full(2 * ctrl_num);
-        g_full.setZero();
-
-        g_full.segment(0, ctrl_num) = gradp.row(0).transpose();
-        g_full.segment(ctrl_num, ctrl_num) = gradp.row(1).transpose();
-
-        g.resize(2 * opt_num);
-        g.setZero();
-
-        for (int k = 0; k < opt_num; ++k) {
-            int i = instance->opt_indices_[k];
-            g(k) = g_full(i);
-            g(k + opt_num) = g_full(i + ctrl_num);
-        }
-
-        return cost_val;
     }
     static inline bool
     smoothed_l1(const double& x, const double& mu, double& f, double& df) noexcept {
@@ -524,12 +215,202 @@ struct TrajOpt::Impl {
         return out_dist < R;
     }
 
+    std::vector<Piece<5, 2>> optimize(
+        const std::vector<Traj::SampledPoint>& sampled,
+        double dt,
+        const RoboState& now,
+        std::optional<std::pair<int, int>> some_no_opt = std::nullopt
+    ) {
+        if (sampled.size() < 5) {
+            RCLCPP_ERROR_STREAM(
+                rclcpp::get_logger("rose_nav:planner"),
+                "sampled too small size: " << sampled.size()
+            );
+            return {};
+        }
+        int no_opt_start = 0;
+        int no_opt_end = 0;
+
+        if (some_no_opt) {
+            no_opt_start = some_no_opt->first;
+            no_opt_end = some_no_opt->second;
+            no_opt_start = std::max(0, no_opt_start);
+            no_opt_end = std::min(static_cast<int>(sampled.size()) - 2, no_opt_end);
+        }
+        sampled_path_ = sampled;
+
+        Eigen::Matrix<double, 2, 3> head_state;
+        head_state << now.pos, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
+
+        Eigen::Matrix<double, 2, 3> tail_state;
+        tail_state << sampled_path_.back().p, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
+
+        const int piece_num = sampled_path_.size() - 1;
+        piece_num_ = piece_num;
+
+        const auto w_smooth = params_.smooth_weight;
+
+        minco_
+            .setConditions(head_state, tail_state, piece_num, Eigen::Vector2d(w_smooth, w_smooth));
+
+        const int ctrl_num = piece_num - 1;
+        std::vector<char> is_no_opt(ctrl_num, false);
+
+        if (some_no_opt) {
+            no_opt_end = std::clamp(no_opt_end, 0, ctrl_num);
+            no_opt_start = std::clamp(no_opt_start, 0, ctrl_num);
+            if (no_opt_start != no_opt_end) {
+                for (int i = no_opt_start; i < no_opt_end; ++i) {
+                    is_no_opt[i] = true;
+                }
+            }
+        }
+
+        opt_indices_.clear();
+        for (int i = 0; i < ctrl_num; ++i) {
+            if (!is_no_opt[i]) {
+                opt_indices_.push_back(i);
+            }
+        }
+        const int opt_num = opt_indices_.size();
+
+        Eigen::VectorXd x_opt(2 * opt_num);
+
+        for (int k = 0; k < opt_num; ++k) {
+            int i = opt_indices_[k];
+            x_opt(k) = sampled_path_[i + 1].p.x();
+            x_opt(k + opt_num) = sampled_path_[i + 1].p.y();
+        }
+
+        in_times_.resize(piece_num);
+        for (int i = 0; i < piece_num; ++i) {
+            in_times_(i) = dt;
+        }
+
+        double min_cost = 0.0;
+        int ret = 0;
+
+        if (opt_num > 0) {
+            ret = lbfgs::lbfgs_optimize(
+                x_opt,
+                min_cost,
+                &TrajOpt::Impl::cost,
+                nullptr,
+                nullptr,
+                this,
+                lbfgs_params_
+            );
+        }
+
+        Eigen::Matrix2Xd in_ps(2, ctrl_num);
+        Eigen::VectorXd full_x(2 * ctrl_num);
+
+        for (int i = 0; i < ctrl_num; ++i) {
+            full_x(i) = sampled_path_[i + 1].p.x();
+            full_x(i + ctrl_num) = sampled_path_[i + 1].p.y();
+        }
+
+        for (int k = 0; k < opt_num; ++k) {
+            int i = opt_indices_[k];
+            full_x(i) = x_opt(k);
+            full_x(i + ctrl_num) = x_opt(k + opt_num);
+        }
+
+        in_ps.row(0) = full_x.head(ctrl_num).transpose();
+        in_ps.row(1) = full_x.segment(ctrl_num, ctrl_num).transpose();
+
+        minco_.setParameters(in_ps, in_times_);
+
+        std::vector<Piece<5, 2>> final_traj;
+        minco_.getPieces(final_traj);
+
+        if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH)) {
+            RCLCPP_ERROR_STREAM(
+                rclcpp::get_logger("rose_nav:planner"),
+                "TrajOpt FAIL: " << lbfgs::lbfgs_strerror(ret)
+            );
+        }
+
+        return final_traj;
+    }
+
+    static double cost(void* ptr, const Eigen::VectorXd& x, Eigen::VectorXd& g) noexcept {
+        auto* instance = static_cast<TrajOpt::Impl*>(ptr);
+
+        const int ctrl_num = instance->piece_num_ - 1;
+        const int opt_num = instance->opt_indices_.size();
+
+        double cost_val = 0.0;
+
+        Eigen::VectorXd full_x(2 * ctrl_num);
+
+        for (int i = 0; i < ctrl_num; ++i) {
+            full_x(i) = instance->sampled_path_[i + 1].p.x();
+            full_x(i + ctrl_num) = instance->sampled_path_[i + 1].p.y();
+        }
+
+        for (int k = 0; k < opt_num; ++k) {
+            int i = instance->opt_indices_[k];
+            full_x(i) = x(k);
+            full_x(i + ctrl_num) = x(k + opt_num);
+        }
+
+        Eigen::Matrix2Xd in_ps(2, ctrl_num);
+        in_ps.row(0) = full_x.head(ctrl_num).transpose();
+        in_ps.row(1) = full_x.segment(ctrl_num, ctrl_num).transpose();
+
+        instance->minco_.setParameters(in_ps, instance->in_times_);
+
+        double energy = 0.0;
+
+        Eigen::Matrix2Xd energy_grad = Eigen::Matrix2Xd::Zero(2, ctrl_num);
+        Eigen::VectorXd energyT_grad = Eigen::VectorXd::Zero(ctrl_num + 1);
+
+        Eigen::Matrix2Xd grad_by_points;
+        Eigen::VectorXd grad_by_times;
+        Eigen::MatrixX2d partial_grad_by_coeffs;
+        Eigen::VectorXd partial_grad_by_times;
+
+        instance->minco_.getEnergyPartialGradByCoeffs(partial_grad_by_coeffs);
+        instance->minco_.getEnergyPartialGradByTimes(partial_grad_by_times);
+        instance->minco_.getEnergy(energy);
+
+        instance->minco_.propogateGrad(
+            partial_grad_by_coeffs,
+            partial_grad_by_times,
+            energy_grad,
+            energyT_grad
+        );
+
+        Eigen::Matrix2Xd gradp = energy_grad;
+
+        cost_val += energy;
+        cost_val += instance->attach_penalty_functional(in_ps, gradp);
+
+        Eigen::VectorXd g_full(2 * ctrl_num);
+        g_full.setZero();
+
+        g_full.segment(0, ctrl_num) = gradp.row(0).transpose();
+        g_full.segment(ctrl_num, ctrl_num) = gradp.row(1).transpose();
+
+        g.resize(2 * opt_num);
+        g.setZero();
+
+        for (int k = 0; k < opt_num; ++k) {
+            int i = instance->opt_indices_[k];
+            g(k) = g_full(i);
+            g(k + opt_num) = g_full(i + ctrl_num);
+        }
+
+        return cost_val;
+    }
+
     int piece_num_;
     map::RoseMap::Ptr rose_map_;
     minco::MINCO_S3NU minco_;
     lbfgs::lbfgs_parameter_t lbfgs_params_;
     Eigen::VectorXd in_times_;
-    std::vector<Eigen::Vector2d> sampled_path_;
+    std::vector<Traj::SampledPoint> sampled_path_;
     std::vector<int> opt_indices_;
 };
 TrajOpt::TrajOpt(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
@@ -538,12 +419,12 @@ TrajOpt::TrajOpt(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
 TrajOpt::~TrajOpt() {
     _impl.reset();
 }
-std::optional<TrajType> TrajOpt::optimize(
-    const std::vector<Eigen::Vector2d>& path,
+std::vector<Piece<5, 2>> TrajOpt::optimize(
+    const std::vector<Traj::SampledPoint>& sampled,
+    double dt,
     const RoboState& now,
-    bool use_opt,
     std::optional<std::pair<int, int>> some_no_opt
 ) {
-    return _impl->optimize(path, now, use_opt, some_no_opt);
+    return _impl->optimize(sampled, dt, now, some_no_opt);
 }
 } // namespace rose_nav::planner

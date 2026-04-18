@@ -1,6 +1,6 @@
 rose_navigation_planner_node:
   ros__parameters:
-    use_sim_time: false
+    use_sim_time: true
     rose_planner:
       robot_radius: 0.3
       target_frame: map
@@ -9,6 +9,9 @@ rose_navigation_planner_node:
       odometry_topic: /Odometry
       goal_topic: /rose_goal
       plan_fps: 10.0
+      sample_ds: 0.2
+      expected_speed: 2.5
+      check_safe_horizon: 4.0
       a_star:
         clearance_weight: 2.0
         obstacle_penalty_weight: 10.0
@@ -17,8 +20,7 @@ rose_navigation_planner_node:
       traj_opt:
         smooth_weight: 3.0
         obstacle_weight: 1000.0
-        sample_ds: 0.2
-        expected_speed: 2.5
+        
       mpc:
         control_fps: 60.0
         predict_dt: 0.05

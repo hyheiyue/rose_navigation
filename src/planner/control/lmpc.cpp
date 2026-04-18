@@ -42,10 +42,10 @@ struct LMPC::Impl {
         last_output_ = output_;
         xbar_.resize(params_.predict_steps + 1);
     }
-    void set_traj(const TrajType& traj) {
-        if (traj.getPieceNum() > 1 && traj.getTotalDuration() > 0.01) {
+    void set_traj(const Traj& traj) {
+        if (traj.traj_pieces.size() > 1 && traj.get_traj_total_duration() > 0.01) {
             traj_ = traj;
-            traj_duration_ = traj.getTotalDuration();
+            traj_duration_ = traj.get_traj_total_duration();
         }
     }
     void set_current(const RoboState& c) {
@@ -59,7 +59,7 @@ struct LMPC::Impl {
         P_.clear();
         P_.reserve(T_in);
 
-        auto t_cur_and_dis = traj_.getTimeByPos(now_state_w_.pos);
+        auto t_cur_and_dis = traj_.get_traj_time_by_pos(now_state_w_.pos);
         if (t_cur_and_dis.second > 0.5) {
             return false;
         }
@@ -80,9 +80,9 @@ struct LMPC::Impl {
             TrajPoint tp;
 
             if (t <= traj_duration_) {
-                auto curr_pos = traj_.getPos(t);
+                auto curr_pos = traj_.get_traj_pos_by_time(t);
                 auto vec = curr_pos - now_pos;
-                auto curr_vel = traj_.getVel(t);
+                auto curr_vel = traj_.get_traj_vel_by_time(t);
                 if (vec.norm() < params_.blind_radius) {
                     t += dt_in;
                     i--;
@@ -92,11 +92,11 @@ struct LMPC::Impl {
                 has_ref = true;
                 tp.pos = curr_pos;
                 tp.vel = curr_vel;
-                tp.acc = traj_.getAcc(t);
-                double yaw = traj_.getYaw(t);
+                tp.acc = traj_.get_traj_acc_by_time(t);
+                double yaw = traj_.get_traj_yaw_by_time(t);
                 yaw = yaw_end + angles::shortest_angular_distance(yaw_end, yaw);
                 tp.yaw = yaw;
-                tp.w = traj_.getYawDot(t);
+                tp.w = traj_.get_traj_yaw_dot_by_time(t);
                 pos_end = tp.pos;
                 vel_end = tp.vel;
                 acc_end = tp.acc;
@@ -434,7 +434,7 @@ struct LMPC::Impl {
         return std::make_optional(o);
     }
     double traj_duration_;
-    TrajType traj_;
+    Traj traj_;
     RoboState now_state_w_;
     std::vector<RoboState> xbar_;
     Eigen::MatrixXd A_, B_;
@@ -468,7 +468,7 @@ LMPC::~LMPC() {
 std::optional<ControlOutput> LMPC::solve(std::chrono::duration<double> dt) {
     return _impl->solve(dt);
 }
-void LMPC::set_traj(const TrajType& traj) {
+void LMPC::set_traj(const Traj& traj) {
     _impl->set_traj(traj);
 }
 void LMPC::set_current(const RoboState& c) {

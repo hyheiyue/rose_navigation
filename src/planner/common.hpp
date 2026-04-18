@@ -154,7 +154,7 @@ struct ControlOutput {
         p_start.x = pos.x();
         p_start.y = pos.y();
         p_start.z = 0.0;
-        double scale = 3.0;
+        double scale = vel.norm();
         auto vel_normalized = vel.normalized();
         p_end.x = pos.x() + scale * vel_normalized.x();
         p_end.y = pos.y() + scale * vel_normalized.y();

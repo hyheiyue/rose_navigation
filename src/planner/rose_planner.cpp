@@ -3,6 +3,7 @@
 #include "control/lmpc.hpp"
 #include "map/rose_map.hpp"
 #include "path_search/a*.hpp"
+#include "planner/traj.hpp"
 #include "traj_opt/trajectory_opt.hpp"
 #include "utils/rcl_tf.hpp"
 #include "utils/rclcpp_parameter_node.hpp"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <memory>
 #include <nav_msgs/msg/path.hpp>
+#include <numeric>
 #include <optional>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
@@ -36,11 +38,17 @@ struct RosePlanner::Impl {
         std::string target_frame;
         bool use_control_output;
         double default_wz;
+        double sample_ds;
+        double expected_speed;
+        double check_safe_horizon;
         void load(const ParamsNode& config) {
             robot_radius = config.declare<double>("robot_radius");
             target_frame = config.declare<std::string>("target_frame");
             use_control_output = config.declare<bool>("use_control_output");
             default_wz = config.declare<double>("default_wz");
+            sample_ds = config.declare<double>("sample_ds");
+            expected_speed = config.declare<double>("expected_speed");
+            check_safe_horizon = config.declare<double>("check_safe_horizon");
         }
     } params_;
     Impl(rclcpp::Node& node) {
@@ -309,221 +317,236 @@ struct RosePlanner::Impl {
         }
     }
     void plan_callback() {
-        bool change_to_wait = false;
-        switch (fsm_) {
-            case FSMSTATE::INIT: {
-                break;
+        auto logger = rclcpp::get_logger("rose_nav:planner");
+
+        auto reached = [&](double dist_to_goal) {
+            RCLCPP_INFO(logger, "Goal reached (dist=%.2f m), go to next goal", dist_to_goal);
+            goal_.pos.pop_front();
+            if (goal_.pos.empty()) {
+                fsm_ = FSMSTATE::WAIT_GOAL;
+                RCLCPP_INFO(logger, "all goal have been reached");
+            } else {
+                fsm_ = FSMSTATE::SEARCH_PATH;
+            }
+        };
+
+        auto build_new_path = [&](const Eigen::Vector2d& current_pos,
+                                  int cut_raw_idx) -> std::vector<Eigen::Vector2d> {
+            const auto& old_raw = current_traj_.raw_path_;
+            cut_raw_idx = std::clamp(cut_raw_idx, 0, static_cast<int>(old_raw.size()) - 2);
+
+            std::vector<Eigen::Vector2d> front_path =
+                search_once(current_pos, old_raw[cut_raw_idx]);
+
+            std::vector<Eigen::Vector2d> new_raw_path = std::move(front_path);
+            new_raw_path.insert(new_raw_path.end(), old_raw.begin() + cut_raw_idx, old_raw.end());
+            return new_raw_path;
+        };
+
+        auto rebuild_traj = [&](const std::vector<Eigen::Vector2d>& new_raw_path,
+                                const RoboState& current,
+                                std::optional<std::pair<int, int>> no_opt_range =
+                                    std::nullopt) -> bool {
+            if (new_raw_path.empty()) {
+                return false;
             }
 
-            case FSMSTATE::WAIT_GOAL: {
-                change_to_wait = false;
+            pub_raw_path(new_raw_path);
+
+            current_traj_.set_raw_path(new_raw_path);
+            current_traj_.resample(params_.sample_ds);
+
+            std::vector<Piece<5, 2>> pieces;
+
+            pieces = traj_opt_->optimize(
+                current_traj_.sampled_,
+                params_.sample_ds / params_.expected_speed,
+                current,
+                no_opt_range
+            );
+
+            if (pieces.empty()) {
+                return false;
+            }
+
+            current_traj_.traj_pieces = std::move(pieces);
+            pub_traj(current_traj_);
+            has_traj_ = true;
+            return true;
+        };
+        static int last_how_to_replan = -1;
+        constexpr int repaln_by_raw = 1;
+        constexpr int repaln_by_traj = 2;
+        switch (fsm_) {
+            case FSMSTATE::INIT:
+            case FSMSTATE::WAIT_GOAL:
+                break;
+
+            case FSMSTATE::SEARCH_PATH: {
+                if (goal_.pos.empty()) {
+                    fsm_ = FSMSTATE::WAIT_GOAL;
+                    break;
+                }
+
+                auto current = robo_->get_now_state();
+                has_traj_ = false;
+
+                auto raw_path = search_once(current.pos, goal_.pos.front());
+                if (rebuild_traj(raw_path, current)) {
+                    last_how_to_replan = -1;
+                    fsm_ = FSMSTATE::REPLAN;
+                    RCLCPP_INFO(logger, "create new traj successfully");
+                }
                 break;
             }
 
             case FSMSTATE::REPLAN: {
                 if (goal_.pos.empty()) {
                     fsm_ = FSMSTATE::WAIT_GOAL;
-                    change_to_wait = true;
                     break;
                 }
-                Eigen::Vector2d goal_pos = goal_.pos.front();
+
                 auto current = robo_->get_now_state();
+                Eigen::Vector2d goal_pos = goal_.pos.front();
                 double dist_to_goal = (goal_pos - current.pos).norm();
+
                 if (dist_to_goal < 0.5) {
+                    reached(dist_to_goal);
+                    break;
+                }
+
+                auto t_and_dis = current_traj_.get_traj_time_by_pos(current.pos);
+                double now_t_in_traj = t_and_dis.first;
+
+                if (t_and_dis.second > 0.5) {
+                    RCLCPP_WARN(logger, "now in traj too far %.2f", t_and_dis.second);
+                    fsm_ = FSMSTATE::SEARCH_PATH;
+                    break;
+                }
+
+                double total_duration = current_traj_.get_traj_total_duration();
+                if (total_duration <= 0) {
+                    reached(dist_to_goal);
+                    break;
+                }
+
+                constexpr double sample_dt = 0.05;
+                double check_end_time =
+                    std::min(now_t_in_traj + params_.check_safe_horizon, total_duration);
+
+                int last_unsafe_raw_idx = -1;
+                double last_unsafe_traj_time = -1.0;
+
+                for (double t = now_t_in_traj; t <= check_end_time; t += sample_dt) {
+                    int traj_idx = current_traj_.locate_traj_piece_idx_by_time(t).first;
+                    int raw_idx = current_traj_.get_raw_idx_by_traj_pieces_idx(traj_idx);
+
+                    if (!is_safe(current_traj_.raw_path_[raw_idx])) {
+                        last_unsafe_raw_idx = raw_idx;
+                    }
+
+                    if (!is_safe(current_traj_.get_traj_pos_by_time(t))) {
+                        last_unsafe_traj_time = t;
+                    }
+                }
+
+                auto get_no_opt_end = [&]() {
+                    int no_opt_end = static_cast<int>(current_traj_.sampled_.size()) - 1;
+                    for (int i = 0; i < static_cast<int>(current_traj_.sampled_.size()); ++i) {
+                        if (current_traj_.sampled_[i].s / params_.expected_speed
+                            > params_.check_safe_horizon) {
+                            no_opt_end = i;
+                            break;
+                        }
+                    }
+                    return no_opt_end;
+                };
+                if (last_unsafe_raw_idx != -1) {
                     RCLCPP_INFO(
-                        rclcpp::get_logger("rose_nav:planner"),
-                        "Goal reached (dist=%.2f m), go to next goal",
-                        dist_to_goal
+                        logger,
+                        "raw path unsafe last_unsafe_raw_idx: %d",
+                        last_unsafe_raw_idx
                     );
-                    goal_.pos.pop_front();
-                    if (goal_.pos.empty()) {
-                        fsm_ = FSMSTATE::WAIT_GOAL;
-                        change_to_wait = true;
-                        RCLCPP_INFO(
-                            rclcpp::get_logger("rose_nav:planner"),
-                            "all goal have been reached"
-                        );
+                    has_traj_ = false;
+
+                    auto new_raw_path = build_new_path(current.pos, last_unsafe_raw_idx);
+
+                    int no_opt_end = get_no_opt_end();
+                    bool traj_valid =
+                        rebuild_traj(new_raw_path, current, std::make_pair(0, no_opt_end));
+
+                    last_how_to_replan = repaln_by_raw;
+                    if (rebuild_traj(new_raw_path, current)) {
+                        RCLCPP_INFO(logger, "local replan success");
+                    } else {
+                        fsm_ = FSMSTATE::SEARCH_PATH;
+                    }
+
+                    break;
+                } else if (last_unsafe_traj_time >= 0) {
+                    last_how_to_replan = repaln_by_traj;
+                    RCLCPP_INFO(
+                        logger,
+                        "traj unsafe last_unsafe_traj_time: %f",
+                        last_unsafe_traj_time
+                    );
+                    has_traj_ = false;
+
+                    double no_opt_end_t =
+                        std::min(now_t_in_traj + params_.check_safe_horizon, total_duration);
+                    int end_traj_piece_idx =
+                        current_traj_.locate_traj_piece_idx_by_time(no_opt_end_t).first;
+                    int end_raw_path_idx =
+                        current_traj_.get_raw_idx_by_traj_pieces_idx(end_traj_piece_idx);
+
+                    auto new_raw_path = build_new_path(current.pos, end_raw_path_idx);
+                    if (new_raw_path.empty()) {
+                        fsm_ = FSMSTATE::SEARCH_PATH;
                         break;
+                    }
+
+                    int no_opt_end = get_no_opt_end();
+
+                    if (rebuild_traj(new_raw_path, current, std::make_pair(0, no_opt_end))) {
+                        RCLCPP_INFO(logger, "local replan success no_opt_end: %d", no_opt_end);
                     } else {
                         fsm_ = FSMSTATE::SEARCH_PATH;
                     }
                     break;
-                }
-                auto t_and_dis = current_traj_.getTimeByPos(current.pos);
-                double now_t_in_traj = t_and_dis.first;
-                if (t_and_dis.second > 0.5) {
-                    RCLCPP_WARN(
-                        rclcpp::get_logger("rose_nav:planner"),
-                        "now in traj too far %.2f",
-                        t_and_dis.second
-                    );
-                    fsm_ = FSMSTATE::SEARCH_PATH;
-                    break;
-                }
-                auto removed = remove_old_path();
-                auto unsafe_points = check_safe_path(removed);
-                if (!unsafe_points.empty()) {
-                    has_traj_ = false;
-                    current_path_ = removed;
-                    local_replan(unsafe_points, goal_pos);
                 } else {
-                    double start_t = now_t_in_traj;
-                    double t = start_t;
-                    std::vector<Eigen::Vector2d> traj_path;
-                    constexpr double horzien = 4.0;
-                    auto traj_duration = current_traj_.getTotalDuration();
-                    while (t < start_t + horzien) {
-                        if (t >= traj_duration) {
-                            break;
-                        }
-                        traj_path.push_back(current_traj_.getPos(t));
-                        t += 0.05;
-                    }
-                    unsafe_points = check_safe_path(traj_path);
-                    if (!unsafe_points.empty()) {
-                        has_traj_ = false;
-                        current_path_ = removed;
-                        int no_opt_end =
-                            removed.size() * (horzien / std::min((traj_duration - start_t), 0.1));
-                        resample_and_opt(removed, std::make_pair(0, no_opt_end));
-                    }
                 }
-                if (fsm_ == FSMSTATE::WAIT_GOAL) {
-                    change_to_wait = true;
-                }
-                break;
-            }
 
-            case FSMSTATE::SEARCH_PATH: {
-                if (goal_.pos.empty()) {
-                    fsm_ = FSMSTATE::WAIT_GOAL;
-                    change_to_wait = true;
-                    break;
-                }
-                has_traj_ = false;
-                search_once(goal_);
-                if (fsm_ == FSMSTATE::WAIT_GOAL) {
-                    change_to_wait = true;
-                }
                 break;
             }
         }
     }
-    std::vector<int> check_safe_path(const std::vector<Eigen::Vector2d>& path) const noexcept {
-        std::vector<int> unsafe_points;
-
-        if (path.size() < 2)
-            return unsafe_points;
-        auto esdf = rose_map_->esdf();
-
-        const double step = std::min(esdf->esdf_->voxel_size * 0.5, params_.robot_radius * 0.5);
-
-        if (step <= 1e-6)
-            return unsafe_points;
-
-        for (size_t i = 0; i + 1 < path.size(); ++i) {
-            const Eigen::Vector2d p0 = path[i];
-            const Eigen::Vector2d p1 = path[i + 1];
-
-            const double seg_len = (p1 - p0).norm();
-            const int n = std::max(1, (int)std::ceil(seg_len / step));
-
-            bool unsafe = false;
-
-            for (int k = 0; k <= n; ++k) {
-                double alpha = (double)k / n;
-                Eigen::Vector2d p = p0 + alpha * (p1 - p0);
-
-                auto key = esdf->world_to_key(p.cast<float>());
-                int idx = esdf->key_to_index(key);
-
-                if (idx < 0)
-                    continue;
-
-                if (esdf->get_esdf(idx) < params_.robot_radius) {
-                    unsafe = true;
-                    break;
-                }
-            }
-
-            if (unsafe)
-                unsafe_points.push_back(i);
-        }
-
-        return unsafe_points;
-    }
-    void search_once(const Goal& goal) {
-        if (goal.pos.empty()) {
-            return;
-        }
-        auto current = robo_->get_now_state();
-        Eigen::Vector2d start_w = current.pos;
-
-        auto [path, search_state] = search(start_w, goal.pos.front());
-        if (search_state == AStar::SearchState::SUCCESS) {
-            current_path_ = path;
-            resample_and_opt(current_path_);
-            fsm_ = FSMSTATE::REPLAN;
-        } else if (search_state == AStar::SearchState::NO_PATH) {
-            RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "No path found by A*");
-            fsm_ = FSMSTATE::SEARCH_PATH;
-        } else if (search_state == AStar::SearchState::TIMEOUT) {
-            RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "A* search timeout");
-            fsm_ = FSMSTATE::SEARCH_PATH;
-        }
-    }
-    void local_replan(const std::vector<int>& unsafe_points, const Eigen::Vector2d& goal_w) {
-        if (current_path_.size() < 2) {
-            RCLCPP_WARN(
-                rclcpp::get_logger("rose_nav:planner"),
-                "Raw path too short for local replan."
-            );
-            return;
-        }
-        auto current = robo_->get_now_state();
-        const int N = static_cast<int>(current_path_.size());
-        Eigen::Vector2d start_w = current.pos;
-        int local_end_idx = unsafe_points.back() + (1 / rose_map_->esdf()->esdf_->voxel_size);
-
-        local_end_idx = std::clamp(local_end_idx, 0, N - 1);
-
-        int next_idx = local_end_idx + 1;
-        if (next_idx >= N) {
-            RCLCPP_WARN(
-                rclcpp::get_logger("rose_nav:planner"),
-                "Local replan end is last point"
-            );
-            fsm_ = FSMSTATE::SEARCH_PATH;
-            return;
-        }
-        std::vector<Eigen::Vector2d> path_after(
-            current_path_.begin() + next_idx,
-            current_path_.end()
-        );
-        auto [local_path, search_state] = search(start_w, current_path_[next_idx]);
+    std::vector<Eigen::Vector2d>
+    search_once(const Eigen::Vector2d& start, const Eigen::Vector2d& goal) {
+        auto [path, search_state] = search(start, goal);
         if (search_state == AStar::SearchState::NO_PATH) {
             RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "No path found by A*");
-            fsm_ = FSMSTATE::SEARCH_PATH;
-            return;
+            return {};
         } else if (search_state == AStar::SearchState::TIMEOUT) {
             RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "A* search timeout");
-            fsm_ = FSMSTATE::SEARCH_PATH;
-            return;
+            return {};
         }
-        if (local_path.empty()) {
-            fsm_ = FSMSTATE::WAIT_GOAL;
-        }
-        std::vector<Eigen::Vector2d> new_raw_path;
-        new_raw_path.reserve(local_path.size() + path_after.size());
-
-        for (const auto& p: local_path) {
-            new_raw_path.emplace_back(p.x(), p.y());
-        }
-        new_raw_path.insert(new_raw_path.end(), path_after.begin(), path_after.end());
-
-        current_path_ = new_raw_path;
-        resample_and_opt(current_path_, std::make_pair(0, local_path.size() - 1));
+        return path;
     }
+    bool is_safe(const Eigen::Vector2d& p) const noexcept {
+        auto esdf = rose_map_->esdf();
+        auto key = esdf->world_to_key(p.cast<float>());
+        int idx = esdf->key_to_index(key);
+
+        if (idx < 0)
+            return true;
+
+        if (esdf->get_esdf(idx) < params_.robot_radius) {
+            return false;
+        }
+
+        return true;
+    };
+
     std::pair<std::vector<Eigen::Vector2d>, AStar::SearchState>
     search(const Eigen::Vector2d& start, const Eigen::Vector2d& goal) {
         std::vector<Eigen::Vector2d> path;
@@ -540,30 +563,6 @@ struct RosePlanner::Impl {
         }
 
         return std::make_pair(path, search_state);
-    }
-    std::vector<Eigen::Vector2d> remove_old_path() {
-        if (current_path_.empty())
-            return {};
-        std::vector<Eigen::Vector2d> r = current_path_;
-        auto current = robo_->get_now_state();
-
-        int best_target_index = -1;
-        double best_dist = std::numeric_limits<double>::infinity();
-
-        for (int i = 0; i < r.size(); ++i) {
-            auto dis = (r[i] - current.pos).norm();
-
-            if (dis < best_dist) {
-                best_dist = dis;
-                best_target_index = i;
-            }
-        }
-        if (best_target_index > 0) {
-            r.erase(r.begin(), r.begin() + best_target_index);
-        }
-        r.front() = current.pos;
-
-        return r;
     }
     void pub_raw_path(const std::vector<Eigen::Vector2d>& path) {
         nav_msgs::msg::Path raw_path_msg;
@@ -582,86 +581,65 @@ struct RosePlanner::Impl {
             raw_path_pub_->publish(raw_path_msg);
         }
     }
+    void pub_traj(const Traj& traj) const {
+        if ((opt_path_pub_->get_subscription_count() > 0
+             || opt_marker_pub_->get_subscription_count() > 0)
+            && traj.traj_pieces.size() > 2)
+        {
+            double dt = 0.05;
+            nav_msgs::msg::Path opt_path_msg;
+            opt_path_msg.header.stamp = node_->now();
+            opt_path_msg.header.frame_id = params_.target_frame;
+            double t_cur = 0.0;
+            opt_path_msg.poses.clear();
 
-    void resample_and_opt(
-        const std::vector<Eigen::Vector2d>& path,
-        std::optional<std::pair<int, int>> some_no_opt = std::nullopt
-    ) noexcept {
-        nav_msgs::msg::Path opt_path_msg;
-        opt_path_msg.header.stamp = node_->now();
-        opt_path_msg.header.frame_id = params_.target_frame;
-        auto current = robo_->get_now_state();
-        pub_raw_path(path);
-        auto opt_traj_opt = traj_opt_->optimize(path, current, USE_OPT, some_no_opt);
+            visualization_msgs::msg::Marker marker;
+            marker.header = opt_path_msg.header;
+            marker.ns = "opt_traj";
+            marker.id = 0;
+            marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+            marker.action = visualization_msgs::msg::Marker::ADD;
 
-        if (opt_traj_opt) {
-            has_traj_ = true;
-            auto opt_traj = *opt_traj_opt;
-            current_traj_ = opt_traj;
-            if ((opt_path_pub_->get_subscription_count() > 0
-                 || opt_marker_pub_->get_subscription_count() > 0)
-                && opt_traj.getPieceNum() > 1)
-            {
-                double dt = 0.05;
-                int sample_num = static_cast<int>(opt_traj.getTotalDuration() / dt) + 2;
+            marker.scale.x = 0.2;
+            marker.scale.y = 0.2;
+            marker.scale.z = 0.2;
 
-                double t_cur = 0.0;
-                opt_path_msg.poses.clear();
+            marker.color.r = 0.1f;
+            marker.color.g = 0.1f;
+            marker.color.b = 0.9f;
+            marker.color.a = 1.0f;
 
-                visualization_msgs::msg::Marker marker;
-                marker.header = opt_path_msg.header;
-                marker.ns = "opt_traj";
-                marker.id = 0;
-                marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
-                marker.action = visualization_msgs::msg::Marker::ADD;
+            marker.points.clear();
+            double total_duration = traj.get_traj_total_duration();
+            while (t_cur <= total_duration) {
+                Eigen::Vector2d pos = traj.get_traj_pos_by_time(t_cur);
+                Eigen::Vector2d vel = traj.get_traj_vel_by_time(t_cur);
+                double yaw =
+                    std::hypot(vel.x(), vel.y()) > 1e-3 ? std::atan2(vel.y(), vel.x()) : 0.0;
+                geometry_msgs::msg::PoseStamped p;
+                p.header = opt_path_msg.header;
+                p.pose.position.x = pos.x();
+                p.pose.position.y = pos.y();
+                p.pose.position.z = 0.0;
 
-                marker.scale.x = 0.2;
-                marker.scale.y = 0.2;
-                marker.scale.z = 0.2;
+                tf2::Quaternion q;
+                q.setRPY(0, 0, yaw);
+                q.normalize();
+                p.pose.orientation = tf2::toMsg(q);
 
-                marker.color.r = 0.1f;
-                marker.color.g = 0.1f;
-                marker.color.b = 0.9f;
-                marker.color.a = 1.0f;
-
-                marker.points.clear();
-
-                for (int i = 0; i < sample_num; ++i) {
-                    Eigen::VectorXd pos = opt_traj.getPos(t_cur);
-                    Eigen::VectorXd vel = opt_traj.getVel(t_cur);
-                    if (pos.size() < 2 || vel.size() < 2)
-                        break;
-
-                    double yaw =
-                        std::hypot(vel.x(), vel.y()) > 1e-3 ? std::atan2(vel.y(), vel.x()) : 0.0;
-                    geometry_msgs::msg::PoseStamped p;
-                    p.header = opt_path_msg.header;
-                    p.pose.position.x = pos.x();
-                    p.pose.position.y = pos.y();
-                    p.pose.position.z = 0.0;
-
-                    tf2::Quaternion q;
-                    q.setRPY(0, 0, yaw);
-                    q.normalize();
-                    p.pose.orientation = tf2::toMsg(q);
-
-                    opt_path_msg.poses.push_back(p);
-                    geometry_msgs::msg::Point mp;
-                    mp.x = pos.x();
-                    mp.y = pos.y();
-                    mp.z = p.pose.position.z;
-                    marker.points.push_back(mp);
-
-                    t_cur = std::min(t_cur + dt, opt_traj.getTotalDuration());
-                }
-                opt_path_pub_->publish(opt_path_msg);
-                opt_marker_pub_->publish(marker);
+                opt_path_msg.poses.push_back(p);
+                geometry_msgs::msg::Point mp;
+                mp.x = pos.x();
+                mp.y = pos.y();
+                mp.z = p.pose.position.z;
+                marker.points.push_back(mp);
+                t_cur += dt;
             }
-        } else {
-            has_traj_ = false;
-            fsm_ = FSMSTATE::WAIT_GOAL;
+            opt_path_pub_->publish(opt_path_msg);
+            opt_marker_pub_->publish(marker);
         }
     }
+
     rclcpp::Node* node_;
 
     FSMSTATE fsm_;
@@ -682,8 +660,7 @@ struct RosePlanner::Impl {
     std::thread plan_thread_;
     std::thread control_thread_;
     double control_fps_;
-    std::vector<Eigen::Vector2d> current_path_;
-    TrajType current_traj_;
+    Traj current_traj_;
     bool has_traj_;
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;

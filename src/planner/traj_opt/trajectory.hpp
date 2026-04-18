@@ -34,7 +34,6 @@
 #include <iostream>
 #include <utility>
 #include <vector>
-
 template<int D, int Freedom>
 class Piece {
 public:
@@ -79,21 +78,18 @@ public:
         return pos;
     }
     inline double getYaw(const double& t) const {
-        // 用速度方向计算 yaw
         Eigen::VectorXd v = getVel(t);
         if (v.size() < 2)
             return 0.0;
         double vx = v(0);
         double vy = v(1);
-        // 速度过小时方向不可信，保护一下
         if (std::hypot(vx, vy) < 1e-6) {
-            return getYaw(0.0); // 回退到起点方向
+            return getYaw(0.0);
         }
         return std::atan2(vy, vx);
     }
 
     inline double getYawDot(const double& t) const {
-        // yaw 导数公式 (ax*vy - ay*vx)/(vx^2+vy^2)
         Eigen::VectorXd v = getVel(t);
         Eigen::VectorXd a = getAcc(t);
         if (v.size() < 2 || a.size() < 2)
@@ -106,7 +102,7 @@ public:
 
         double v2 = vx * vx + vy * vy;
         if (v2 < 1e-12)
-            return 0.0; // 速度太小，角速度设 0 避免爆炸
+            return 0.0;
         return (ax * vy - ay * vx) / v2;
     }
 
@@ -322,42 +318,7 @@ public:
             return RootFinder::countRoots(coeff, 0.0, 1.0) == 0;
         }
     }
-    static double binomialCoeff(int n, int k) {
-        if (k < 0 || k > n)
-            return 0.0;
-        if (k == 0 || k == n)
-            return 1.0;
-        double res = 1.0;
-        for (int i = 1; i <= k; ++i) {
-            res *= (n - (k - i));
-            res /= i;
-        }
-        return res;
-    }
-
-    static CoefficientMat shiftCoeffMat(const CoefficientMat& cMat, double t0) {
-        CoefficientMat newMat;
-        newMat.setZero();
-
-        for (int i = 0; i <= D; ++i) {
-            int n = D - i;
-            const auto& ci = cMat.col(i);
-
-            double t0_pow = 1.0;
-            for (int j = n; j >= 0; --j) {
-                int idx = D - j;
-                newMat.col(idx) += ci * binomialCoeff(n, j) * t0_pow;
-                t0_pow *= t0;
-            }
-        }
-        return newMat;
-    }
-
-    inline Piece shift(double t0) const {
-        return Piece(duration - t0, shiftCoeffMat(coeffMat, t0));
-    }
 };
-
 template<int D, int Freedom>
 class Trajectory {
 private:
@@ -376,42 +337,6 @@ public:
         for (int i = 0; i < N; i++) {
             pieces.emplace_back(durs[i], cMats[i]);
         }
-    }
-    inline std::vector<Eigen::Vector2d> toPointVector(double dt) const {
-        std::vector<Eigen::Vector2d> pts;
-        if (pieces.empty())
-            return pts;
-
-        double totalT = getTotalDuration();
-        double n_est = 0.0;
-
-        if (dt > 1e-9 && totalT > 0.0 && std::isfinite(dt) && std::isfinite(totalT)) {
-            n_est = std::ceil(totalT / dt) + 2;
-        }
-
-        size_t N = 0;
-        if (n_est > 0.0 && n_est < 1e7) {
-            N = static_cast<size_t>(n_est);
-        }
-
-        const size_t MAX_RESERVE = 5000;
-        N = std::min(N, MAX_RESERVE);
-
-        pts.reserve(N);
-
-        for (int i = 0; i < getPieceNum(); ++i) {
-            double T = pieces[i].getDuration();
-            double t = 0.0;
-
-            while (t < T) {
-                pts.push_back(pieces[i].getPos(t));
-                t += dt;
-            }
-
-            pts.push_back(pieces[i].getPos(T));
-        }
-
-        return pts;
     }
 
     inline int getPieceNum() const {
@@ -624,86 +549,5 @@ public:
             t += smaple_dt;
         }
         return std::make_pair(best_t, min_dis);
-    }
-
-    inline std::vector<Eigen::Vector2d>
-    toPointVectorBySpacing(double ds, double dt_search = 0.01) const {
-        std::vector<Eigen::Vector2d> pts;
-
-        if (pieces.empty() || ds <= 1e-6 || dt_search <= 1e-6)
-            return pts;
-
-        const double totalT = getTotalDuration();
-        if (totalT <= 0.0 || !std::isfinite(totalT))
-            return pts;
-
-        pts.reserve(2000);
-
-        double t = 0.0;
-        Eigen::Vector2d last_pt = getPos(0.0);
-        pts.push_back(last_pt);
-
-        double acc_dist = 0.0;
-
-        while (t < totalT) {
-            t += dt_search;
-            if (t > totalT)
-                t = totalT;
-
-            Eigen::Vector2d cur_pt = getPos(t);
-            double d = (cur_pt - last_pt).norm();
-            acc_dist += d;
-
-            if (acc_dist >= ds) {
-                pts.push_back(cur_pt);
-                acc_dist = 0.0;
-            }
-
-            last_pt = cur_pt;
-        }
-
-        Eigen::Vector2d end_pt = getPos(totalT);
-        if (pts.empty() || (pts.back() - end_pt).norm() > 1e-6) {
-            pts.push_back(end_pt);
-        }
-
-        return pts;
-    }
-    inline void truncateBeforeTime(double t) {
-        if (pieces.empty())
-            return;
-
-        if (t <= 0.0)
-            return;
-
-        double totalT = getTotalDuration();
-        if (t >= totalT) {
-            pieces.clear();
-            return;
-        }
-
-        double local_t = t;
-        int idx = locatePieceIdx(local_t);
-
-        Pieces new_pieces;
-        new_pieces.reserve(pieces.size() - idx);
-
-        const Piece<D, Freedom>& old_piece = pieces[idx];
-        const double old_T = old_piece.getDuration();
-        const double new_T = old_T - local_t;
-
-        Eigen::VectorXd p0 = old_piece.getPos(local_t);
-        Eigen::VectorXd v0 = old_piece.getVel(local_t);
-        Eigen::VectorXd a0 = old_piece.getAcc(local_t);
-        typename Piece<D, Freedom>::CoefficientMat new_cMat = old_piece.getCoeffMat();
-
-        new_cMat = Piece<D, Freedom>::shiftCoeffMat(new_cMat, local_t);
-
-        new_pieces.emplace_back(new_T, new_cMat);
-        for (int i = idx + 1; i < pieces.size(); ++i) {
-            new_pieces.push_back(pieces[i]);
-        }
-
-        pieces.swap(new_pieces);
     }
 };

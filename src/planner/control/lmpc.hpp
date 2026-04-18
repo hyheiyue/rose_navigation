@@ -1,6 +1,7 @@
 #pragma once
 #include "map/rose_map.hpp"
 #include "planner/common.hpp"
+#include "planner/traj.hpp"
 #include "utils/rclcpp_parameter_node.hpp"
 #include <memory>
 namespace rose_nav::planner {
@@ -12,7 +13,7 @@ public:
         return std::make_unique<LMPC>(rose_map, config);
     }
     std::optional<ControlOutput> solve(std::chrono::duration<double> dt);
-    void set_traj(const TrajType& traj);
+    void set_traj(const Traj& traj);
     void set_current(const RoboState& c);
     ~LMPC();
     struct Impl;

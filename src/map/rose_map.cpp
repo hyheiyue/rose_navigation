@@ -22,6 +22,17 @@
 #include <thread>
 namespace rose_nav::map {
 struct RoseMap::Impl {
+    struct BinParams {
+        float cos_thresh;
+        double bottom_z_to_robo_z;
+        double top_z_to_robo_z;
+        void load(const ParamsNode& config) {
+            float max_slope_deg = config.declare<float>("max_slope_deg");
+            cos_thresh = std::cos(max_slope_deg * M_PI / 180.0f);
+            bottom_z_to_robo_z = config.declare<double>("bottom_z_to_robo_z");
+            top_z_to_robo_z = config.declare<double>("top_z_to_robo_z");
+        }
+    } bin_params_;
     Impl(rclcpp::Node& node) {
         node_ = &node;
         tf_ = std::make_unique<RclTF>(node);
@@ -29,8 +40,7 @@ struct RoseMap::Impl {
         auto config = ParamsNode(node, "rose_map");
         occ_map_ = OccMap::create(config.sub("occ_map"));
         auto bin_ph = config.sub("bin_map");
-        float max_slope_deg = bin_ph.declare<float>("max_slope_deg");
-        cos_thresh_ = std::cos(max_slope_deg * M_PI / 180.0f);
+        bin_params_.load(bin_ph);
         int max_update_rate = config.declare<int>("max_update_rate");
         max_update_dt_ = 1.0 / max_update_rate;
         bin_map_ = BinMap::create(bin_ph);
@@ -286,12 +296,12 @@ struct RoseMap::Impl {
         auto& bin_voxel = bin->voxel_map_;
         auto voxel_3d = occ_map_->get_voxel_map();
         static std::unique_ptr<SlidingVoxelMap<2, float>> slope_map;
+        constexpr double _diff = -0.5;
         if (!slope_map) {
             auto max_k_3d = voxel_3d->max_key;
             auto max_p_3d = voxel_3d->key_to_world(max_k_3d);
             auto min_k_3d = voxel_3d->min_key;
             auto min_p_3d = voxel_3d->key_to_world(min_k_3d);
-            constexpr double _diff = 0.5;
             min_p_3d.x() += _diff;
             min_p_3d.y() += _diff;
             max_p_3d.x() -= _diff;
@@ -322,7 +332,9 @@ struct RoseMap::Impl {
             pointcloud->point(i) << w3d.cast<double>(), 1.0;
         }
         small_gicp::estimate_normals_tbb(*pointcloud, 20);
-
+        double robo_z = voxel_3d->get_center().z();
+        double min_z = robo_z + bin_params_.bottom_z_to_robo_z;
+        double max_z = robo_z + bin_params_.top_z_to_robo_z;
         std::vector<int> count(slope_map->grid.size(), 0);
 
         for (size_t i = 0; i < pointcloud->size(); ++i) {
@@ -332,18 +344,22 @@ struct RoseMap::Impl {
                 continue;
             float cos_theta = std::abs(n.z());
             int idx2d = slope_map->world_to_index(Eigen::Vector2f(pt.x(), pt.y()));
-            if (idx2d < 0)
+            if (idx2d < 0 || pt.z() < min_z || pt.z() > max_z)
                 continue;
             slope_map->grid[idx2d] += cos_theta;
             count[idx2d]++;
         }
         for (auto it = bin_voxel->grid.begin(); it != bin_voxel->grid.end();) {
             auto p = bin_voxel->hash_to_world(it->first);
-            if (slope_map->world_to_index(p) >= 0) {
-                if (!it->second.is_static) {
-                    it = bin_voxel->grid.erase(it);
-                    continue;
-                }
+            // if (slope_map->world_to_index(p) >= 0) {
+            //     if (!it->second.is_static) {
+            //         it = bin_voxel->grid.erase(it);
+            //         continue;
+            //     }
+            // }
+            if (!it->second.is_static) {
+                it = bin_voxel->grid.erase(it);
+                continue;
             }
             ++it;
         }
@@ -360,7 +376,7 @@ struct RoseMap::Impl {
             }
             float avg_cos = slope_map->grid[i] / count[i];
             slope_map->grid[i] = 0.0;
-            if (avg_cos < cos_thresh_) {
+            if (avg_cos < bin_params_.cos_thresh) {
                 bin_voxel->set_cell(p, BinMap::Cell { .is_static = false });
             }
         }
@@ -371,7 +387,6 @@ struct RoseMap::Impl {
     OccMap::Ptr occ_map_;
     BinMap::Ptr bin_map_;
     ESDF::Ptr esdf_;
-    float cos_thresh_;
     std::string sensor_frame_;
     std::string target_frame_;
     double max_update_dt_ = 0.1;

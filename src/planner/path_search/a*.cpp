@@ -114,8 +114,8 @@ struct AStar::Impl {
         return dist + clearance;
     }
 
-    inline void
-    getSuccessors(const map::VoxelKey<2>& cur, std::vector<map::VoxelKey<2>>& succ) const noexcept {
+    inline void get_successors(const map::VoxelKey<2>& cur, std::vector<map::VoxelKey<2>>& succ)
+        const noexcept {
         succ.clear();
         static const int dx[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
         static const int dy[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
@@ -156,7 +156,12 @@ struct AStar::Impl {
         int start_idx = esdf->key_to_index(start);
         int goal_idx = esdf->key_to_index(goal);
         if (start_idx < 0) {
-            RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "start out of map");
+            RCLCPP_WARN(
+                rclcpp::get_logger("rose_nav:planner"),
+                "start out of map: x:%.2f, y:%.2f",
+                start_w.x(),
+                start_w.y()
+            );
             return SearchState::NO_PATH;
         }
         bool goal_projected = false;
@@ -222,7 +227,7 @@ struct AStar::Impl {
                 return SearchState::SUCCESS;
             }
 
-            getSuccessors(nodes_[cid].key, succ_buffer_);
+            get_successors(nodes_[cid].key, succ_buffer_);
 
             for (const auto& nbk: succ_buffer_) {
                 int nb_idx = esdf->key_to_index(nbk);

@@ -1130,7 +1130,14 @@ public:
 
         return;
     }
-
+    inline void getPieces(std::vector<Piece<5, 2>>& traj) const {
+        traj.clear();
+        traj.reserve(N);
+        for (int i = 0; i < N; i++) {
+            traj.emplace_back(T1(i), b.block<6, 2>(6 * i, 0).transpose().rowwise().reverse());
+        }
+        return;
+    }
     inline void getTrajectory(Trajectory<5, 2>& traj) const {
         traj.clear();
         traj.reserve(N);
