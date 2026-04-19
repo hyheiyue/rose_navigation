@@ -18,7 +18,6 @@ public:
     std::vector<Piece<5, 2>> optimize(
         const std::vector<Traj::SampledPoint>& sampled,
         double dt,
-        const RoboState& now,
         std::optional<std::pair<int, int>> some_no_opt = std::nullopt
     );
     struct Impl;

@@ -26,11 +26,13 @@ struct RoseMap::Impl {
         float cos_thresh;
         double bottom_z_to_robo_z;
         double top_z_to_robo_z;
+        int count_thresh;
         void load(const ParamsNode& config) {
             float max_slope_deg = config.declare<float>("max_slope_deg");
             cos_thresh = std::cos(max_slope_deg * M_PI / 180.0f);
             bottom_z_to_robo_z = config.declare<double>("bottom_z_to_robo_z");
             top_z_to_robo_z = config.declare<double>("top_z_to_robo_z");
+            count_thresh = config.declare<int>("count_thresh");
         }
     } bin_params_;
     Impl(rclcpp::Node& node) {
@@ -364,7 +366,7 @@ struct RoseMap::Impl {
             ++it;
         }
         for (int i = 0; i < slope_map->grid.size(); ++i) {
-            if (count[i] == 0) {
+            if (count[i] <= bin_params_.count_thresh) {
                 slope_map->grid[i] = 0.0;
                 continue;
             }

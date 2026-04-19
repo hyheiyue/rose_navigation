@@ -20,7 +20,7 @@ rose_navigation_planner_node:
       traj_opt:
         smooth_weight: 3.0
         obstacle_weight: 1000.0
-        
+        enable: false
       mpc:
         control_fps: 60.0
         predict_dt: 0.05
@@ -57,6 +57,9 @@ rose_navigation_planner_node:
       bin_map:
         voxel_size: 0.05
         max_slope_deg: 30.0
+        bottom_z_to_robo_z: -0.2
+        top_z_to_robo_z: 0.1
+        count_thresh: 8
         static_map_path: "/home/hy/rose_nav/src/bringup_nav/map/simulation/rmuc_2026.yaml"
       esdf:
         use_diagonals: true

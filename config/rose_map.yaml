@@ -27,6 +27,7 @@ rose_navigation_map_node:
         max_slope_deg: 30.0
         bottom_z_to_robo_z: -0.2
         top_z_to_robo_z: 0.1
+        count_thresh: 8
         static_map_path: "/home/hy/rose_nav/src/bringup_nav/map/simulation/rmuc_2024.yaml"
       esdf:
         use_diagonals: true

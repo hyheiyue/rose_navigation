@@ -361,7 +361,6 @@ struct RosePlanner::Impl {
             pieces = traj_opt_->optimize(
                 current_traj_.sampled_,
                 params_.sample_ds / params_.expected_speed,
-                current,
                 no_opt_range
             );
 
@@ -410,7 +409,7 @@ struct RosePlanner::Impl {
                 Eigen::Vector2d goal_pos = goal_.pos.front();
                 double dist_to_goal = (goal_pos - current.pos).norm();
 
-                if (dist_to_goal < 0.5) {
+                if (dist_to_goal < 0.2) {
                     reached(dist_to_goal);
                     break;
                 }
@@ -450,17 +449,6 @@ struct RosePlanner::Impl {
                     }
                 }
 
-                auto get_no_opt_end = [&]() {
-                    int no_opt_end = static_cast<int>(current_traj_.sampled_.size()) - 1;
-                    for (int i = 0; i < static_cast<int>(current_traj_.sampled_.size()); ++i) {
-                        if (current_traj_.sampled_[i].s / params_.expected_speed
-                            > params_.check_safe_horizon) {
-                            no_opt_end = i;
-                            break;
-                        }
-                    }
-                    return no_opt_end;
-                };
                 if (last_unsafe_raw_idx != -1) {
                     RCLCPP_INFO(
                         logger,
@@ -471,12 +459,19 @@ struct RosePlanner::Impl {
 
                     auto new_raw_path = build_new_path(current.pos, last_unsafe_raw_idx);
 
-                    int no_opt_end = get_no_opt_end();
+                    int no_opt_end = static_cast<int>(current_traj_.sampled_.size()) - 1;
+                    for (int i = 0; i < static_cast<int>(current_traj_.sampled_.size()); ++i) {
+                        if (current_traj_.sampled_[i].s / params_.expected_speed
+                            > params_.check_safe_horizon) {
+                            no_opt_end = i;
+                            break;
+                        }
+                    }
                     bool traj_valid =
                         rebuild_traj(new_raw_path, current, std::make_pair(0, no_opt_end));
 
                     last_how_to_replan = repaln_by_raw;
-                    if (rebuild_traj(new_raw_path, current)) {
+                    if (traj_valid) {
                         RCLCPP_INFO(logger, "local replan success");
                     } else {
                         fsm_ = FSMSTATE::SEARCH_PATH;
@@ -498,20 +493,22 @@ struct RosePlanner::Impl {
                         current_traj_.locate_traj_piece_idx_by_time(no_opt_end_t).first;
                     int end_raw_path_idx =
                         current_traj_.get_raw_idx_by_traj_pieces_idx(end_traj_piece_idx);
+                    int end_sampled_idx =
+                        current_traj_.get_sampled_idx_by_traj_pieces_idx(end_traj_piece_idx);
+                    auto pieces = traj_opt_->optimize(
+                        current_traj_.sampled_,
+                        params_.sample_ds / params_.expected_speed,
+                        std::make_pair(0, end_sampled_idx)
+                    );
 
-                    auto new_raw_path = build_new_path(current.pos, end_raw_path_idx);
-                    if (new_raw_path.empty()) {
-                        fsm_ = FSMSTATE::SEARCH_PATH;
-                        break;
-                    }
-
-                    int no_opt_end = get_no_opt_end();
-
-                    if (rebuild_traj(new_raw_path, current, std::make_pair(0, no_opt_end))) {
-                        RCLCPP_INFO(logger, "local replan success no_opt_end: %d", no_opt_end);
+                    if (!pieces.empty()) {
+                        RCLCPP_INFO(logger, "local replan success");
+                        current_traj_.traj_pieces = std::move(pieces);
+                        has_traj_ = true;
                     } else {
                         fsm_ = FSMSTATE::SEARCH_PATH;
                     }
+
                     break;
                 } else {
                 }

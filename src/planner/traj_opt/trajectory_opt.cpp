@@ -16,9 +16,11 @@ struct TrajOpt::Impl {
     struct Params {
         double smooth_weight;
         double obstacle_weight;
+        bool enable;
         void load(const ParamsNode& config) {
             smooth_weight = config.declare<double>("smooth_weight");
             obstacle_weight = config.declare<double>("obstacle_weight");
+            enable = config.declare<bool>("enable");
         }
     } params_;
     Impl(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
@@ -218,7 +220,6 @@ struct TrajOpt::Impl {
     std::vector<Piece<5, 2>> optimize(
         const std::vector<Traj::SampledPoint>& sampled,
         double dt,
-        const RoboState& now,
         std::optional<std::pair<int, int>> some_no_opt = std::nullopt
     ) {
         if (sampled.size() < 5) {
@@ -240,7 +241,7 @@ struct TrajOpt::Impl {
         sampled_path_ = sampled;
 
         Eigen::Matrix<double, 2, 3> head_state;
-        head_state << now.pos, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
+        head_state << sampled_path_.front().p, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
 
         Eigen::Matrix<double, 2, 3> tail_state;
         tail_state << sampled_path_.back().p, Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero();
@@ -290,7 +291,7 @@ struct TrajOpt::Impl {
         double min_cost = 0.0;
         int ret = 0;
 
-        if (opt_num > 0) {
+        if (opt_num > 0 && params_.enable) {
             ret = lbfgs::lbfgs_optimize(
                 x_opt,
                 min_cost,
@@ -422,9 +423,8 @@ TrajOpt::~TrajOpt() {
 std::vector<Piece<5, 2>> TrajOpt::optimize(
     const std::vector<Traj::SampledPoint>& sampled,
     double dt,
-    const RoboState& now,
     std::optional<std::pair<int, int>> some_no_opt
 ) {
-    return _impl->optimize(sampled, dt, now, some_no_opt);
+    return _impl->optimize(sampled, dt,  some_no_opt);
 }
 } // namespace rose_nav::planner
