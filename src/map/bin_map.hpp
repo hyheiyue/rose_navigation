@@ -24,9 +24,8 @@ public:
     }
     std::vector<Eigen::Vector4f> get_occupied_points() const {
         std::vector<Eigen::Vector4f> pts;
-        for (const auto& hv: voxel_map_->grid) {
-            const auto& h = hv.first;
-            auto p = voxel_map_->hash_to_world(h);
+        for (const auto& [key, cell]: voxel_map_->grid) {
+            auto p = voxel_map_->key_to_world(key);
             pts.emplace_back(Eigen::Vector4f(p.x(), p.y(), 0, 1));
         }
         return pts;
@@ -86,22 +85,27 @@ public:
 
         voxel_map_->clear();
 
-        for (int y = 0; y < size.y(); ++y) {
+        const int width = img.cols;
+        const int height = img.rows;
+
+        for (int y = 0; y < height; ++y) {
             const uint8_t* row_ptr = img.ptr<uint8_t>(y);
 
-            for (int x = 0; x < size.x(); ++x) {
+            for (int x = 0; x < width; ++x) {
                 uint8_t v = row_ptr[x];
+
                 if (negate)
-                    v = static_cast<uint8_t>(255 - v);
+                    v = 255 - v;
 
                 float occ = (255.f - v) / 255.f;
-                if (occ >= occ_th) {
-                    float wx = origin.x() + x * resolution;
-                    float wy = origin.y() + (size.y() - 1 - y) * resolution;
-                    Eigen::Vector2f wp(wx, wy);
 
-                    voxel_map_->set_cell(wp, Cell { .is_static = true });
-                }
+                if (occ < occ_th)
+                    continue;
+
+                float wx = origin.x() + (x + 0.5f) * resolution;
+                float wy = origin.y() + (height - 1 - y + 0.5f) * resolution;
+
+                voxel_map_->set_cell({ wx, wy }, Cell { .is_static = true });
             }
         }
 

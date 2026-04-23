@@ -425,6 +425,6 @@ std::vector<Piece<5, 2>> TrajOpt::optimize(
     double dt,
     std::optional<std::pair<int, int>> some_no_opt
 ) {
-    return _impl->optimize(sampled, dt,  some_no_opt);
+    return _impl->optimize(sampled, dt, some_no_opt);
 }
 } // namespace rose_nav::planner

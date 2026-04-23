@@ -61,7 +61,7 @@ struct RoseMap::Impl {
                 last_header_ = pc_msg->header;
                 double frame_time = ros_time - t_init;
                 static Eigen::Isometry3d msg_in_target = Eigen::Isometry3d::Identity();
-                auto msg_in_target_opt = tf_->get_transform(
+                auto msg_in_target_opt = tf_->get_transform<double>(
                     target_frame_,
                     pc_msg->header.frame_id,
                     pc_msg->header.stamp,
@@ -89,7 +89,7 @@ struct RoseMap::Impl {
                 }
 
                 static Eigen::Isometry3d sensor_in_target = Eigen::Isometry3d::Identity();
-                auto sensor_in_target_opt = tf_->get_transform(
+                auto sensor_in_target_opt = tf_->get_transform<double>(
                     target_frame_,
                     sensor_frame_,
                     pc_msg->header.stamp,
@@ -114,7 +114,11 @@ struct RoseMap::Impl {
             rclcpp::SensorDataQoS(),
             [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
                 const auto& odom = *msg;
-                auto T = tf_->get_transform(target_frame_, msg->header.frame_id, msg->header.stamp);
+                auto T = tf_->get_transform<double>(
+                    target_frame_,
+                    msg->header.frame_id,
+                    msg->header.stamp
+                );
                 if (!T.has_value()) {
                     return;
                 }
@@ -275,8 +279,7 @@ struct RoseMap::Impl {
 
                 msg.data.assign(width * height, 0); // unknown
 
-                for (const auto& [h, cell]: bin_voxel->grid) {
-                    auto key = bin_voxel->hash_to_key(h);
+                for (const auto& [key, cell]: bin_voxel->grid) {
                     int x = key.x() - min_key.x();
                     int y = key.y() - min_key.y();
 
@@ -352,7 +355,7 @@ struct RoseMap::Impl {
             count[idx2d]++;
         }
         for (auto it = bin_voxel->grid.begin(); it != bin_voxel->grid.end();) {
-            auto p = bin_voxel->hash_to_world(it->first);
+            auto p = bin_voxel->key_to_world(it->first);
             // if (slope_map->world_to_index(p) >= 0) {
             //     if (!it->second.is_static) {
             //         it = bin_voxel->grid.erase(it);

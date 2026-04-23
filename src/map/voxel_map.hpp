@@ -126,10 +126,38 @@ class HashVoxelMap {
     static_assert(Dim == 2 || Dim == 3, "Dim must be 2 or 3");
 
 public:
-    using HashType = uint64_t;
     using Ptr = std::shared_ptr<HashVoxelMap>;
     using Key = VoxelKey<Dim>;
     using EigenPoint = Eigen::Matrix<float, Dim, 1>;
+
+    struct KeyHash {
+        size_t operator()(const Key& k) const noexcept {
+            uint64_t x = static_cast<uint32_t>(k.x());
+            uint64_t y = static_cast<uint32_t>(k.y());
+
+            if constexpr (Dim == 2) {
+                uint64_t h = x * 0x9E3779B185EBCA87ull ^ y * 0xC2B2AE3D27D4EB4Full;
+                return final_mix(h);
+            } else {
+                uint64_t z = static_cast<uint32_t>(k.z());
+
+                uint64_t h = x * 0x9E3779B185EBCA87ull ^ y * 0xC2B2AE3D27D4EB4Full
+                    ^ z * 0x165667B19E3779F9ull;
+
+                return final_mix(h);
+            }
+        }
+
+    private:
+        static inline uint64_t final_mix(uint64_t h) noexcept {
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            h *= 0xc4ceb9fe1a85ec53ULL;
+            h ^= h >> 33;
+            return h;
+        }
+    };
 
     explicit HashVoxelMap(float voxel_size_): voxel_size(voxel_size_) {}
 
@@ -137,74 +165,29 @@ public:
         return std::make_shared<HashVoxelMap>(voxel_size);
     }
 
-private:
-    static inline uint64_t encode(int v) noexcept {
-        return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 31);
-    }
-
-    static inline int decode(uint64_t v) noexcept {
-        return static_cast<int>((v >> 1) ^ (~(v & 1) + 1));
-    }
-
-public:
-    inline HashType key_to_hash(const Key& k) const noexcept {
-        if constexpr (Dim == 2) {
-            return (encode(k.x()) << 32) | (encode(k.y()) & 0xFFFFFFFFull);
-        } else { // Dim == 3
-            return (encode(k.x()) << 42) | (encode(k.y()) << 21) | (encode(k.z()) & 0x1FFFFFull);
-        }
-    }
-
-    inline Key hash_to_key(HashType hash) const noexcept {
-        Key k;
-
-        if constexpr (Dim == 2) {
-            uint64_t ex = hash >> 32;
-            uint64_t ey = hash & 0xFFFFFFFFull;
-
-            k.x() = decode(ex);
-            k.y() = decode(ey);
-        } else {
-            uint64_t ex = (hash >> 42) & 0x1FFFFFull;
-            uint64_t ey = (hash >> 21) & 0x1FFFFFull;
-            uint64_t ez = hash & 0x1FFFFFull;
-
-            k.x() = decode(ex);
-            k.y() = decode(ey);
-            k.z() = decode(ez);
-        }
-        return k;
-    }
     inline Key world_to_key(const EigenPoint& p) const noexcept {
         Key k;
         const float inv = 1.0f / voxel_size;
-        for (int i = 0; i < Dim; ++i)
+        for (int i = 0; i < Dim; ++i) {
             k.data[i] = static_cast<int>(std::floor(p[i] * inv + 1e-6f));
+        }
         return k;
     }
 
     inline EigenPoint key_to_world(const Key& k) const noexcept {
         EigenPoint p;
-        for (int i = 0; i < Dim; ++i)
+        for (int i = 0; i < Dim; ++i) {
             p[i] = (k.data[i] + 0.5f) * voxel_size;
+        }
         return p;
-    }
-
-    inline HashType world_to_hash(const EigenPoint& p) const noexcept {
-        return key_to_hash(world_to_key(p));
-    }
-
-    inline EigenPoint hash_to_world(HashType hash) const noexcept {
-        return key_to_world(hash_to_key(hash));
     }
 
     void set_cell(const EigenPoint& pos, const Cell& value) {
         Key k = world_to_key(pos);
-        auto h = key_to_hash(k);
 
-        grid[h] = value;
+        grid[k] = value;
 
-        if (grid.empty()) {
+        if (grid.size() == 1) {
             min_key = k;
             max_key = k;
         } else {
@@ -214,17 +197,20 @@ public:
     }
 
     Cell* get_cell(const EigenPoint& pos) {
-        auto it = grid.find(world_to_hash(pos));
-        if (it != grid.end())
+        Key k = world_to_key(pos);
+        auto it = grid.find(k);
+        if (it != grid.end()) {
             return &it->second;
+        }
         return nullptr;
     }
 
     void remove_cell(const EigenPoint& pos) {
         Key k = world_to_key(pos);
         auto it = grid.find(k);
-        if (it == grid.end())
+        if (it == grid.end()) {
             return;
+        }
 
         grid.erase(it);
 
@@ -233,7 +219,6 @@ public:
         }
 
         bool touch_boundary = false;
-
         for (int i = 0; i < Dim; ++i) {
             if (k[i] == min_key[i] || k[i] == max_key[i]) {
                 touch_boundary = true;
@@ -241,23 +226,21 @@ public:
             }
         }
 
-        if (!touch_boundary)
-            return;
-
-        recompute_min_max();
+        if (touch_boundary) {
+            recompute_min_max();
+        }
     }
+
     void recompute_min_max() {
         auto it = grid.begin();
-
         min_key = it->first;
         max_key = it->first;
 
         ++it;
-
         for (; it != grid.end(); ++it) {
             const Key& k = it->first;
-            min_key = min_key.cwiseMin(k);
-            max_key = max_key.cwiseMax(k);
+            min_key = min_key.cwise_min(k);
+            max_key = max_key.cwise_max(k);
         }
     }
 
@@ -268,12 +251,14 @@ public:
     size_t size() const {
         return grid.size();
     }
+
+public:
     Key min_key;
     Key max_key;
 
-public:
     float voxel_size;
-    ankerl::unordered_dense::map<HashType, Cell> grid;
+
+    ankerl::unordered_dense::map<Key, Cell, KeyHash> grid;
 };
 template<int Dim, typename Cell>
 class SlidingVoxelMap {

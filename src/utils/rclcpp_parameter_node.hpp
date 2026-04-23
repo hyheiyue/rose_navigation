@@ -12,11 +12,27 @@ public:
 
     template<typename T>
     [[nodiscard]] T declare(const std::string& name, const T& default_value) const {
-        return node_.declare_parameter(prefix_ + name, default_value);
+        const std::string full = prefix_ + name;
+
+        if (node_.has_parameter(full)) {
+            T value;
+            node_.get_parameter(full, value);
+            return value;
+        }
+
+        return node_.declare_parameter<T>(full, default_value);
     }
     template<typename T>
     [[nodiscard]] T declare(const std::string& name) const {
-        return node_.declare_parameter<T>(prefix_ + name);
+        const std::string full = prefix_ + name;
+
+        if (node_.has_parameter(full)) {
+            T value;
+            node_.get_parameter(full, value);
+            return value;
+        }
+
+        return node_.declare_parameter<T>(full);
     }
 
     [[nodiscard]] ParamsNode sub(const std::string& sub_prefix) const {

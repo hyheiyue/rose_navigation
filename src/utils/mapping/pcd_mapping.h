@@ -37,6 +37,7 @@ private:
 
 public:
     explicit PCDMapping(float resolution);
+    PCDMapping() = default;
 
 private:
     [[nodiscard]] GridKeyType get_position_index(const Eigen::Vector3f& pt) const;

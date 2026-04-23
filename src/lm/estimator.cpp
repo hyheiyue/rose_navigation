@@ -5,6 +5,8 @@
  */
 
 #include "estimator.h"
+#include "lm/eskf.h"
+#include "utils/io/pcd_io.h"
 #include <tbb/tbb.h>
 namespace rose_nav::lm {
 constexpr int NUM_MATCH_POINTS = 100;
@@ -28,6 +30,42 @@ Estimator::Estimator(const ParamsNode& config) {
 
 void Estimator::reset() {
     ivox = std::make_shared<SmallIVox>(params_.map_resolution, 1000000);
+    if (params_.use_priori_pcd_add_ivox) {
+        std::vector<Eigen::Vector3f> pointcloud;
+        if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
+            RCLCPP_INFO(
+                rclcpp::get_logger("rose_nav::lm"),
+                "pcd: %s loaded",
+                params_.prior_pcd_path.c_str()
+            );
+            tbb::parallel_sort(
+                pointcloud.begin(),
+                pointcloud.end(),
+                [&](const auto& a, const auto& b) {
+                    return (a - params_.init_pose_in_prior_pcd.translation().cast<float>())
+                               .squaredNorm()
+                        > (b - params_.init_pose_in_prior_pcd.translation().cast<float>())
+                              .squaredNorm();
+                }
+            );
+            for (const auto& p: pointcloud) {
+                ivox->add_point(p);
+            }
+            RCLCPP_INFO(
+                rclcpp::get_logger("rose_nav::lm"),
+                "ivox add %d points",
+                static_cast<int>(pointcloud.size())
+            );
+            kf.x.position = params_.init_pose_in_prior_pcd.translation().cast<state::value_type>();
+            kf.x.rotation = params_.init_pose_in_prior_pcd.linear().cast<state::value_type>();
+        } else {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("rose_nav::lm"),
+                "Failed to load pcd: %s",
+                params_.prior_pcd_path.c_str()
+            );
+        }
+    }
     kf.P = Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Identity() * 0.01;
     kf.P.block<3, 3>(state::gravity_index, state::gravity_index).diagonal().fill(0.0001);
     kf.P.block<3, 3>(state::bg_index, state::bg_index).diagonal().fill(0.001);

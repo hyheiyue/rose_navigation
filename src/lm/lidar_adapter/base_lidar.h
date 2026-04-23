@@ -17,7 +17,7 @@ public:
     virtual void setup_subscription(
         rclcpp::Node* node,
         const std::string& topic,
-        std::function<void(const std::vector<common::Point>&, const rclcpp::Time&)> callback
+        std::function<void(std::vector<common::Point>&, const rclcpp::Time&)> callback
     ) = 0;
 };
 

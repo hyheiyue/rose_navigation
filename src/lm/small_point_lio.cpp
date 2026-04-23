@@ -14,26 +14,41 @@
 #include "utils/rclcpp_parameter_node.hpp"
 #include "utils/utils.hpp"
 #include <Eigen/src/Core/Matrix.h>
+#include <Eigen/src/Geometry/Transform.h>
 #include <chrono>
+#include <cstddef>
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/logging.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <small_gicp/ann/kdtree_tbb.hpp>
+#include <small_gicp/ann/traits.hpp>
+#include <small_gicp/factors/gicp_factor.hpp>
+#include <small_gicp/points/point_cloud.hpp>
+#include <small_gicp/registration/reduction_tbb.hpp>
+#include <small_gicp/registration/registration.hpp>
+#include <small_gicp/util/downsampling_tbb.hpp>
+#include <small_gicp/util/normal_estimation_tbb.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <string>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_sort.h>
+#include <tf2/LinearMath/Transform.hpp>
+#include <thread>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
-
+//ros2 service call /map_save std_srvs/srv/Trigger
 namespace rose_nav::lm {
 struct SmallPointLIO::Impl {
     struct Params {
         std::string lidar_frame;
         std::string robot_base_frame;
         std::string base_frame;
+        bool robo_to_lidar_dynamic = false;
         bool save_pcd;
         bool batch_update;
         double min_distance_squared;
@@ -41,10 +56,18 @@ struct SmallPointLIO::Impl {
         double space_downsample_leaf_size = 0.1;
         double batch_interval = 0.01;
         int point_filter_num = 1;
+        bool use_priori_pcd_for_algin = false;
+        std::string prior_pcd_path;
+        Eigen::Isometry3d init_pose_in_prior_pcd;
+        int algin_max_iter;
+        double algin_fps;
+        double algin_max_sq;
+        double algin_leaf_size;
         void load(const ParamsNode& config) {
             lidar_frame = config.declare<std::string>("lidar_frame");
             robot_base_frame = config.declare<std::string>("robot_base_frame");
             base_frame = config.declare<std::string>("base_frame");
+            robo_to_lidar_dynamic = config.declare<bool>("robo_to_lidar_dynamic");
             save_pcd = config.declare<bool>("save_pcd");
             batch_update = config.declare<bool>("batch_update");
             auto min_distance = config.declare<double>("min_distance");
@@ -54,8 +77,32 @@ struct SmallPointLIO::Impl {
             space_downsample_leaf_size = config.declare<double>("space_downsample_leaf_size");
             batch_interval = config.declare<double>("batch_interval");
             point_filter_num = config.declare<int>("point_filter_num");
+            use_priori_pcd_for_algin = config.declare<bool>("use_priori_pcd_for_algin");
+            prior_pcd_path = config.declare<std::string>("prior_pcd_path");
+            auto init_pose_in_prior_pcd_config = config.sub("init_pose_in_prior_pcd");
+            init_pose_in_prior_pcd = Eigen::Isometry3d::Identity();
+            auto init_pose_in_prior_pcd_t_vec =
+                init_pose_in_prior_pcd_config.declare<std::vector<double>>("translation");
+            init_pose_in_prior_pcd.translation() = Eigen::Vector3d(
+                init_pose_in_prior_pcd_t_vec[0],
+                init_pose_in_prior_pcd_t_vec[1],
+                init_pose_in_prior_pcd_t_vec[2]
+            );
+            auto init_pose_in_prior_pcd_r_vec =
+                init_pose_in_prior_pcd_config.declare<std::vector<double>>("rotation");
+
+            init_pose_in_prior_pcd.linear() << init_pose_in_prior_pcd_r_vec[0],
+                init_pose_in_prior_pcd_r_vec[1], init_pose_in_prior_pcd_r_vec[2],
+                init_pose_in_prior_pcd_r_vec[3], init_pose_in_prior_pcd_r_vec[4],
+                init_pose_in_prior_pcd_r_vec[5], init_pose_in_prior_pcd_r_vec[6],
+                init_pose_in_prior_pcd_r_vec[7], init_pose_in_prior_pcd_r_vec[8];
+            algin_fps = config.declare<double>("algin_fps");
+            algin_max_sq = config.declare<double>("algin_max_sq");
+            algin_leaf_size = config.declare<double>("algin_leaf_size");
+            algin_max_iter = config.declare<int>("algin_max_iter");
         }
     } params_;
+    static constexpr int algin_near_num = 20;
     Impl(rclcpp::Node& node) {
         node_ = &node;
         tf_ = std::make_unique<RclTF>(node);
@@ -72,6 +119,9 @@ struct SmallPointLIO::Impl {
             imu_topic,
             rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
+                if (!has_lidar_to_robot_transform_) {
+                    return;
+                }
                 common::ImuMsg imu_msg;
                 imu_msg.angular_velocity = Eigen::Vector3d(
                     msg->angular_velocity.x,
@@ -83,6 +133,12 @@ struct SmallPointLIO::Impl {
                     msg->linear_acceleration.y,
                     msg->linear_acceleration.z
                 );
+                if (!params_.robo_to_lidar_dynamic) {
+                    imu_msg.angular_velocity =
+                        lidar_to_robot_init_.linear() * imu_msg.angular_velocity;
+                    imu_msg.linear_acceleration =
+                        lidar_to_robot_init_.linear() * imu_msg.linear_acceleration;
+                }
                 imu_msg.timestamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
                 on_imu_callback(imu_msg);
                 handle_once();
@@ -118,7 +174,31 @@ struct SmallPointLIO::Impl {
         lidar_adapter_->setup_subscription(
             node_,
             lidar_topic,
-            [this](const std::vector<common::Point>& pointcloud, const rclcpp::Time&) {
+            [this](std::vector<common::Point>& pointcloud, const rclcpp::Time& time_msg) {
+                if (!has_lidar_to_robot_transform_) {
+                    auto l2r_opt = tf_->get_transform<double>(
+                        params_.robot_base_frame,
+                        params_.lidar_frame,
+                        time_msg,
+                        rclcpp::Duration::from_seconds(1.0)
+                    );
+                    if (l2r_opt) {
+                        lidar_to_robot_init_ = l2r_opt.value();
+                        auto lidar_odom_to_odom_msg = RclTF::eigen2tf(lidar_to_robot_init_);
+                        tf2::fromMsg(lidar_odom_to_odom_msg, lidar_odom_to_odom_tf2_);
+                        has_lidar_to_robot_transform_ = true;
+
+                    } else {
+                        return;
+                    }
+                }
+                if (!params_.robo_to_lidar_dynamic) {
+                    auto lidar_to_robot_init_f = lidar_to_robot_init_.cast<float>();
+                    for (auto& p: pointcloud) {
+                        p.position = lidar_to_robot_init_f * p.position;
+                    }
+                }
+
                 on_point_cloud_callback(pointcloud);
                 handle_once();
                 log_ctx_.pointcloud_cbk_count++;
@@ -143,6 +223,68 @@ struct SmallPointLIO::Impl {
                 }).detach();
             }
         );
+        if (params_.use_priori_pcd_for_algin) {
+            std::vector<Eigen::Vector3f> pointcloud;
+            if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
+                RCLCPP_INFO(
+                    rclcpp::get_logger("rose_nav::lm"),
+                    "pcd: %s loaded",
+                    params_.prior_pcd_path.c_str()
+                );
+                target_cloud_ = std::make_shared<small_gicp::PointCloud>();
+                target_cloud_->resize(pointcloud.size());
+                for (size_t i = 0; i < pointcloud.size(); ++i) {
+                    target_cloud_->point(i) << pointcloud[i].cast<double>(), 1.0;
+                }
+                small_gicp::voxelgrid_sampling_tbb(*target_cloud_, params_.algin_leaf_size);
+                small_gicp::estimate_normals_tbb(*target_cloud_, algin_near_num);
+                small_gicp::estimate_covariances_tbb(*target_cloud_, algin_near_num);
+                target_tree_ = std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(
+                    target_cloud_,
+                    small_gicp::KdTreeBuilderTBB()
+                );
+                now_pose_in_prior_pcd_ = params_.init_pose_in_prior_pcd;
+                register_ = std::make_shared<small_gicp::Registration<
+                    small_gicp::GICPFactor,
+                    small_gicp::ParallelReductionTBB>>();
+                register_->rejector.max_dist_sq = params_.algin_max_sq;
+                register_->optimizer.max_iterations = params_.algin_max_iter;
+                algin_source_grid_ = std::make_unique<utils::PCDMapping>(params_.algin_leaf_size);
+                map_to_odom_pub_thread_ = std::thread([&]() {
+                    auto next_tp = std::chrono::steady_clock::now();
+                    while (rclcpp::ok()) {
+                        next_tp += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(1.0 / 250.0)
+                        );
+                        geometry_msgs::msg::TransformStamped tf_msg;
+                        tf_msg.header.stamp = node_->now();
+                        tf_msg.header.frame_id = "map";
+                        tf_msg.child_frame_id = "odom";
+                        auto map_to_odom_msg = RclTF::eigen2tf(now_pose_in_prior_pcd_.inverse());
+                        tf_msg.transform = map_to_odom_msg;
+                        tf_->publish_transform(tf_msg);
+                        std::this_thread::sleep_until(next_tp);
+                    }
+                });
+                algin_thread_ = std::thread([&]() {
+                    auto next_tp = std::chrono::steady_clock::now();
+                    while (rclcpp::ok()) {
+                        next_tp += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(1.0 / params_.algin_fps)
+                        );
+                        algin_callback();
+                        std::this_thread::sleep_until(next_tp);
+                    }
+                });
+
+            } else {
+                RCLCPP_ERROR(
+                    rclcpp::get_logger("rose_nav::lm"),
+                    "Failed to load pcd: %s",
+                    params_.prior_pcd_path.c_str()
+                );
+            }
+        }
         marker_pub_ =
             node_->create_publisher<visualization_msgs::msg::MarkerArray>("/lm_marker", 10);
         odom_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 1000);
@@ -164,7 +306,7 @@ struct SmallPointLIO::Impl {
     void handle_once() {
         static double time_current = -1.0;
         static bool is_inited = false;
-        std::vector<Eigen::Vector3f> pointcloud_odom_frame;
+        static std::vector<Eigen::Vector3f> pointcloud_odom_frame;
 
         auto start = std::chrono::steady_clock::now();
 
@@ -197,7 +339,7 @@ struct SmallPointLIO::Impl {
                 && (!estimator_->params_.fix_gravity_direction
                     || preprocess_.imu_deque.size() >= 200))
             {
-                if (params_.batch_update) {
+                if (params_.batch_update && !estimator_->params_.use_priori_pcd_add_ivox) {
                     for (const auto& batch: preprocess_.point_batch_deque) {
                         for (const auto& point: batch.points) {
                             estimator_->ivox->add_point(point.position);
@@ -322,10 +464,11 @@ struct SmallPointLIO::Impl {
                     estimator_->kf.predict_state(time_current);
                     estimator_->current_batch = batch_frame;
                     estimator_->kf.update_iterated_batch();
-
+                    // if (!estimator_->params_.use_priori_pcd) {
                     for (const auto& point: estimator_->points_odom_frame) {
                         estimator_->ivox->add_point(point);
                     }
+                    // }
 
                     log_ctx_.processed_points += estimator_->points_odom_frame.size();
                     preprocess_.point_batch_deque.pop_front();
@@ -340,8 +483,10 @@ struct SmallPointLIO::Impl {
                     time_current = point_lidar_frame.timestamp;
                     estimator_->kf.predict_state(time_current);
                     estimator_->point_lidar_frame = point_lidar_frame.position;
-                    estimator_->kf.update_point();
+                    bool has_matched = estimator_->kf.update_point();
+                    // if (!estimator_->params_.use_priori_pcd) {
                     estimator_->ivox->add_point(estimator_->point_odom_frame);
+                    // }
 
                     log_ctx_.processed_points++;
                     preprocess_.point_deque.pop_front();
@@ -403,8 +548,7 @@ struct SmallPointLIO::Impl {
             std::chrono::duration<double>(1.0)
         );
     }
-    bool is_first_pointcloud_ = true;
-    tf2::Transform tf_odom_to_lodom_;
+
     common::Odometry last_odometry_;
     void publish_pointCloud(const std::vector<Eigen::Vector3f>& pointcloud) {
         if (utils::publisher_sub(pointcloud_pub_)) {
@@ -412,23 +556,6 @@ struct SmallPointLIO::Impl {
             time_msg.sec = std::floor(last_odometry_.timestamp);
             time_msg.nanosec =
                 static_cast<uint32_t>((last_odometry_.timestamp - time_msg.sec) * 1e9);
-            geometry_msgs::msg::TransformStamped lidar_frame_to_base_link_transform;
-            tf2::Transform tf_in_odom = tf_odom_to_lodom_;
-            lidar_frame_to_base_link_transform.transform = tf2::toMsg(tf_in_odom);
-            lidar_frame_to_base_link_transform.header.frame_id = "odom";
-            Eigen::Vector3f lidar_frame_to_base_link_T;
-            lidar_frame_to_base_link_T
-                << static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.x),
-                static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.y),
-                static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.z);
-            Eigen::Matrix3f lidar_frame_to_base_link_R =
-                Eigen::Quaternionf(
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.w),
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.x),
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.y),
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.z)
-                )
-                    .toRotationMatrix();
             sensor_msgs::msg::PointCloud2 msg;
             msg.header.stamp = time_msg;
             msg.header.frame_id = "odom";
@@ -463,7 +590,9 @@ struct SmallPointLIO::Impl {
             Eigen::Vector3f transformed_point;
             auto pointer = reinterpret_cast<float*>(msg.data.data());
             for (const auto& point: pointcloud) {
-                transformed_point = lidar_frame_to_base_link_R * point + lidar_frame_to_base_link_T;
+                transformed_point = params_.robo_to_lidar_dynamic
+                    ? (lidar_to_robot_init_.cast<float>() * point)
+                    : point;
                 *pointer = transformed_point.x();
                 ++pointer;
                 *pointer = transformed_point.y();
@@ -474,30 +603,22 @@ struct SmallPointLIO::Impl {
                 ++pointer;
                 if (pcd_mapping)
                     pcd_mapping->add_point(transformed_point);
+                if (algin_source_grid_) {
+                    std::unique_lock<std::mutex> lock(source_mutex_);
+                    algin_source_grid_->add_point(transformed_point);
+                }
             }
             msg.is_dense = false;
             pointcloud_pub_->publish(msg);
-        } else if (pcd_mapping) {
-            geometry_msgs::msg::TransformStamped lidar_frame_to_base_link_transform;
-            tf2::Transform tf_in_odom = tf_odom_to_lodom_;
-            lidar_frame_to_base_link_transform.transform = tf2::toMsg(tf_in_odom);
-            Eigen::Vector3f lidar_frame_to_base_link_T;
-            lidar_frame_to_base_link_T
-                << static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.x),
-                static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.y),
-                static_cast<float>(lidar_frame_to_base_link_transform.transform.translation.z);
-            Eigen::Matrix3f lidar_frame_to_base_link_R =
-                Eigen::Quaternionf(
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.w),
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.x),
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.y),
-                    static_cast<float>(lidar_frame_to_base_link_transform.transform.rotation.z)
-                )
-                    .toRotationMatrix();
-            Eigen::Vector3f transformed_point;
+        } else if (pcd_mapping || algin_source_grid_) {
             for (const auto& point: pointcloud) {
-                transformed_point = lidar_frame_to_base_link_R * point + lidar_frame_to_base_link_T;
-                pcd_mapping->add_point(transformed_point);
+                if (pcd_mapping) {
+                    pcd_mapping->add_point(point);
+                }
+                if (algin_source_grid_) {
+                    std::unique_lock<std::mutex> lock(source_mutex_);
+                    algin_source_grid_->add_point(point);
+                }
             }
         }
     }
@@ -507,93 +628,111 @@ struct SmallPointLIO::Impl {
         builtin_interfaces::msg::Time time_msg;
         time_msg.sec = std::floor(odometry.timestamp);
         time_msg.nanosec = static_cast<uint32_t>((odometry.timestamp - time_msg.sec) * 1e9);
-        tf2::Transform tf_lidar_to_lodom;
-        tf_lidar_to_lodom.setOrigin(
-            tf2::Vector3(odometry.position.x(), odometry.position.y(), odometry.position.z())
-        );
-        tf_lidar_to_lodom.setRotation(tf2::Quaternion(
-            odometry.orientation.x(),
-            odometry.orientation.y(),
-            odometry.orientation.z(),
-            odometry.orientation.w()
-        ));
-        if (is_first_pointcloud_) {
-            auto l2r_opt = tf_->get_tf2_transform(
-                params_.lidar_frame,
-                params_.robot_base_frame,
-                time_msg,
-                rclcpp::Duration::from_seconds(1.0)
-            );
-            if (l2r_opt) {
-                tf_odom_to_lodom_ = l2r_opt.value().inverse();
-                is_first_pointcloud_ = false;
-            } else {
-                return;
-            }
-        }
-        static tf2::Transform tf_lidar_to_robot;
-        static tf2::Transform tf_robot_to_base;
-        auto tf_lidar_to_robot_opt = tf_->get_tf2_transform(
-            params_.lidar_frame,
-            params_.robot_base_frame,
-            time_msg,
-            rclcpp::Duration::from_seconds(0.1)
-        );
-        if (tf_lidar_to_robot_opt) {
-            tf_lidar_to_robot = tf_lidar_to_robot_opt.value();
-        }
-        auto tf_robot_to_base_opt = tf_->get_tf2_transform(
-            params_.robot_base_frame,
-            params_.base_frame,
-            time_msg,
-            rclcpp::Duration::from_seconds(0.1)
-        );
-        if (tf_robot_to_base_opt) {
-            tf_robot_to_base = tf_robot_to_base_opt.value();
-        }
-        tf2::Transform tf_robot_to_odom =
-            tf_lidar_to_robot.inverse() * tf_lidar_to_lodom * tf_odom_to_lodom_.inverse();
-        auto tf_base_to_odom = tf_robot_to_base * tf_robot_to_odom;
-        geometry_msgs::msg::TransformStamped tf_msg;
-        tf_msg.header.stamp = time_msg;
-        tf_msg.header.frame_id = "odom";
-        tf_msg.child_frame_id = params_.base_frame;
-        tf_msg.transform = tf2::toMsg(tf_base_to_odom);
-        tf_->publish_transform(tf_msg);
-
         nav_msgs::msg::Odometry odom_msg;
         odom_msg.header.stamp = time_msg;
         odom_msg.header.frame_id = "odom";
         odom_msg.child_frame_id = params_.robot_base_frame;
-        const auto& t = tf_robot_to_odom.getOrigin();
-        const auto& q = tf_robot_to_odom.getRotation();
-        odom_msg.pose.pose.position.x = t.x();
-        odom_msg.pose.pose.position.y = t.y();
-        odom_msg.pose.pose.position.z = t.z();
-        odom_msg.pose.pose.orientation = tf2::toMsg(q);
-        static tf2::Transform last_tf;
-        static rclcpp::Time last_stamp = rclcpp::Time(time_msg);
-        if (last_stamp.nanoseconds() > 0) {
-            rclcpp::Time current_time(time_msg);
-            double dt = (current_time - last_stamp).seconds();
-            if (dt > 1e-6) {
-                auto diff = tf_robot_to_odom.getOrigin() - last_tf.getOrigin();
-                odom_msg.twist.twist.linear.x = diff.x() / dt;
-                odom_msg.twist.twist.linear.y = diff.y() / dt;
-                odom_msg.twist.twist.linear.z = diff.z() / dt;
-
-                tf2::Quaternion dq =
-                    tf_robot_to_odom.getRotation() * last_tf.getRotation().inverse();
-                tf2::Vector3 axis = dq.getAxis();
-                double angle = dq.getAngle();
-                tf2::Vector3 ang_vel = axis * angle / dt;
-                odom_msg.twist.twist.angular.x = ang_vel.x();
-                odom_msg.twist.twist.angular.y = ang_vel.y();
-                odom_msg.twist.twist.angular.z = ang_vel.z();
+        geometry_msgs::msg::TransformStamped tf_msg;
+        tf_msg.header.stamp = time_msg;
+        tf_msg.header.frame_id = "odom";
+        tf_msg.child_frame_id = params_.base_frame;
+        if (params_.robo_to_lidar_dynamic) {
+            Eigen::Isometry3d lidar_to_lidar_odom = Eigen::Isometry3d::Identity();
+            lidar_to_lidar_odom.translation() = odometry.position;
+            lidar_to_lidar_odom.linear() = odometry.orientation.toRotationMatrix();
+            static tf2::Transform lidar_to_robot_now;
+            static tf2::Transform robot_to_base;
+            auto lidar_to_robot_now_opt = tf_->get_tf2_transform(
+                params_.lidar_frame,
+                params_.robot_base_frame,
+                time_msg,
+                rclcpp::Duration::from_seconds(0.1)
+            );
+            if (lidar_to_robot_now_opt) {
+                lidar_to_robot_now = lidar_to_robot_now_opt.value();
             }
+            auto robot_to_base_opt = tf_->get_tf2_transform(
+                params_.robot_base_frame,
+                params_.base_frame,
+                time_msg,
+                rclcpp::Duration::from_seconds(0.1)
+            );
+            if (robot_to_base_opt) {
+                robot_to_base = robot_to_base_opt.value();
+            }
+            auto lidar_to_lidar_odom_msg = RclTF::eigen2tf(lidar_to_lidar_odom);
+            tf2::Transform lidar_to_lidar_odom_tf2;
+            tf2::fromMsg(lidar_to_lidar_odom_msg, lidar_to_lidar_odom_tf2);
+            tf2::Transform tf_robot_to_odom = lidar_to_robot_now.inverse() * lidar_to_lidar_odom_tf2
+                * lidar_odom_to_odom_tf2_.inverse();
+            auto tf_base_to_odom = robot_to_base * tf_robot_to_odom;
+
+            tf_msg.transform = tf2::toMsg(tf_base_to_odom);
+
+            const auto& t = tf_robot_to_odom.getOrigin();
+            const auto& q = tf_robot_to_odom.getRotation();
+            odom_msg.pose.pose.position.x = t.x();
+            odom_msg.pose.pose.position.y = t.y();
+            odom_msg.pose.pose.position.z = t.z();
+            odom_msg.pose.pose.orientation = tf2::toMsg(q);
+            static tf2::Transform last_tf_robot_to_odom;
+            static rclcpp::Time last_stamp = rclcpp::Time(time_msg);
+            if (last_stamp.nanoseconds() > 0) {
+                rclcpp::Time current_time(time_msg);
+                double dt = (current_time - last_stamp).seconds();
+                if (dt > 1e-6) {
+                    auto diff = tf_robot_to_odom.getOrigin() - last_tf_robot_to_odom.getOrigin();
+                    odom_msg.twist.twist.linear.x = diff.x() / dt;
+                    odom_msg.twist.twist.linear.y = diff.y() / dt;
+                    odom_msg.twist.twist.linear.z = diff.z() / dt;
+
+                    tf2::Quaternion dq = tf_robot_to_odom.getRotation()
+                        * last_tf_robot_to_odom.getRotation().inverse();
+                    tf2::Vector3 axis = dq.getAxis();
+                    double angle = dq.getAngle();
+                    tf2::Vector3 ang_vel = axis * angle / dt;
+                    odom_msg.twist.twist.angular.x = ang_vel.x();
+                    odom_msg.twist.twist.angular.y = ang_vel.y();
+                    odom_msg.twist.twist.angular.z = ang_vel.z();
+                }
+            }
+            last_tf_robot_to_odom = tf_robot_to_odom;
+            last_stamp = time_msg;
+        } else {
+            Eigen::Isometry3d robot_to_odom = Eigen::Isometry3d::Identity();
+            robot_to_odom.translation() = odometry.position;
+            robot_to_odom.linear() = odometry.orientation.toRotationMatrix();
+            static tf2::Transform robot_to_base;
+            auto robot_to_base_opt = tf_->get_tf2_transform(
+                params_.robot_base_frame,
+                params_.base_frame,
+                time_msg,
+                rclcpp::Duration::from_seconds(0.1)
+            );
+            if (robot_to_base_opt) {
+                robot_to_base = robot_to_base_opt.value();
+            }
+            tf2::Transform tf_robot_to_odom;
+            auto robot_to_odom_msg = RclTF::eigen2tf(robot_to_odom);
+            tf2::fromMsg(robot_to_odom_msg, tf_robot_to_odom);
+            auto tf_base_to_odom = robot_to_base * tf_robot_to_odom;
+
+            tf_msg.transform = tf2::toMsg(tf_base_to_odom);
+
+            odom_msg.pose.pose.position.x = odometry.position.x();
+            odom_msg.pose.pose.position.y = odometry.position.y();
+            odom_msg.pose.pose.position.z = odometry.position.z();
+            odom_msg.pose.pose.orientation.x = odometry.orientation.x();
+            odom_msg.pose.pose.orientation.y = odometry.orientation.y();
+            odom_msg.pose.pose.orientation.z = odometry.orientation.z();
+            odom_msg.pose.pose.orientation.w = odometry.orientation.w();
+            odom_msg.twist.twist.linear.x = odometry.velocity.x();
+            odom_msg.twist.twist.linear.y = odometry.velocity.y();
+            odom_msg.twist.twist.linear.z = odometry.velocity.z();
+            odom_msg.twist.twist.angular.x = odometry.angular_velocity.x();
+            odom_msg.twist.twist.angular.y = odometry.angular_velocity.y();
+            odom_msg.twist.twist.angular.z = odometry.angular_velocity.z();
         }
-        last_tf = tf_robot_to_odom;
-        last_stamp = time_msg;
 
         visualization_msgs::msg::Marker linear_v_marker;
         linear_v_marker.type = visualization_msgs::msg::Marker::ARROW;
@@ -618,6 +757,7 @@ struct SmallPointLIO::Impl {
         visualization_msgs::msg::MarkerArray marker_array;
         marker_array.markers.push_back(linear_v_marker);
         marker_pub_->publish(marker_array);
+        tf_->publish_transform(tf_msg);
         odom_pub_->publish(odom_msg);
     }
 
@@ -837,6 +977,35 @@ struct SmallPointLIO::Impl {
         preprocess_.imu_deque.emplace_back(imu_msg);
         last_imu_timestamp = imu_msg.timestamp;
     }
+    void algin_callback() {
+        utils::PCDMapping algin_source_grid;
+        {
+            std::unique_lock<std::mutex> lock(source_mutex_);
+            algin_source_grid = *algin_source_grid_;
+        }
+        auto source = algin_source_grid.get_points();
+        auto source_cloud = std::make_shared<small_gicp::PointCloud>();
+        source_cloud->resize(source.size());
+        for (size_t i = 0; i < source.size(); ++i) {
+            source_cloud->point(i) << source[i].cast<double>(), 1.0;
+        }
+        small_gicp::estimate_normals_tbb(*source_cloud, algin_near_num);
+        small_gicp::estimate_covariances_tbb(*source_cloud, algin_near_num);
+
+        auto result = register_->align(
+            *target_cloud_,
+            *source_cloud,
+            *target_tree_,
+            now_pose_in_prior_pcd_.inverse()
+        );
+        if (!result.converged) {
+            RCLCPP_ERROR_STREAM(
+                rclcpp::get_logger("rose_nav:lm"),
+                "GICP did not converge, iter_num: " << result.iterations
+            );
+        }
+        now_pose_in_prior_pcd_ = result.T_target_source.inverse();
+    }
     struct Preprocess {
         std::deque<common::Point> point_deque;
         std::deque<common::ImuMsg> imu_deque;
@@ -855,6 +1024,21 @@ struct SmallPointLIO::Impl {
     Eigen::Matrix<state::value_type, state::DIM, state::DIM> Q;
     RclTF::Ptr tf_;
     std::unique_ptr<utils::PCDMapping> pcd_mapping;
+    Eigen::Isometry3d lidar_to_robot_init_;
+    tf2::Transform lidar_odom_to_odom_tf2_;
+    bool has_lidar_to_robot_transform_ = false;
+    mutable std::mutex source_mutex_;
+    std::thread algin_thread_;
+    std::thread map_to_odom_pub_thread_;
+    std::unique_ptr<utils::PCDMapping> algin_source_grid_;
+    std::shared_ptr<
+        small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionTBB>>
+        register_;
+    small_gicp::PointCloud::Ptr target_cloud_;
+    small_gicp::KdTree<small_gicp::PointCloud>::Ptr target_tree_;
+    small_gicp::PointCloud::Ptr source_cloud_;
+
+    Eigen::Isometry3d now_pose_in_prior_pcd_;
 };
 SmallPointLIO::SmallPointLIO(rclcpp::Node& node) {
     _impl = std::make_unique<Impl>(node);

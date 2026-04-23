@@ -132,9 +132,8 @@ void ESDF::propagate_key_distance_field_two_pass(
 }
 void ESDF::rebuild_signed() {
     std::vector<uint8_t> acc(esdf_->grid_size(), false);
-    for (const auto& hv: bin_map_->voxel_map_->grid) {
-        auto h = hv.first;
-        auto p = bin_map_->voxel_map_->hash_to_world(h);
+    for (const auto& [key, cell]: bin_map_->voxel_map_->grid) {
+        auto p = bin_map_->voxel_map_->key_to_world(key);
         int idx = esdf_->world_to_index(p);
         if (idx >= 0) {
             acc[idx] = true;

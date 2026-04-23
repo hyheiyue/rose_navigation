@@ -71,7 +71,7 @@ struct RosePlanner::Impl {
                 const auto& odom_in = *msg;
 
                 static Eigen::Isometry3d T;
-                if (auto opt = tf_->get_transform(
+                if (auto opt = tf_->get_transform<double>(
                         params_.target_frame,
                         odom_in.header.frame_id,
                         odom_in.header.stamp,
@@ -137,7 +137,7 @@ struct RosePlanner::Impl {
             10,
             [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
                 static Eigen::Isometry3d target_2_msg = Eigen::Isometry3d::Identity();
-                auto target_2_msg_opt = tf_->get_transform(
+                auto target_2_msg_opt = tf_->get_transform<double>(
                     params_.target_frame,
                     msg->header.frame_id,
                     msg->header.stamp,
@@ -158,7 +158,7 @@ struct RosePlanner::Impl {
             10,
             [this](const geometry_msgs::msg::PointStamped::SharedPtr msg) {
                 static Eigen::Isometry3d target_2_msg = Eigen::Isometry3d::Identity();
-                auto target_2_msg_opt = tf_->get_transform(
+                auto target_2_msg_opt = tf_->get_transform<double>(
                     params_.target_frame,
                     msg->header.frame_id,
                     msg->header.stamp,
@@ -456,7 +456,7 @@ struct RosePlanner::Impl {
                         last_unsafe_raw_idx
                     );
                     has_traj_ = false;
-
+                    last_unsafe_raw_idx += 1.0 / rose_map_->esdf()->esdf_->voxel_size;
                     auto new_raw_path = build_new_path(current.pos, last_unsafe_raw_idx);
 
                     int no_opt_end = static_cast<int>(current_traj_.sampled_.size()) - 1;
@@ -473,6 +473,7 @@ struct RosePlanner::Impl {
                     last_how_to_replan = repaln_by_raw;
                     if (traj_valid) {
                         RCLCPP_INFO(logger, "local replan success");
+
                     } else {
                         fsm_ = FSMSTATE::SEARCH_PATH;
                     }
@@ -505,6 +506,7 @@ struct RosePlanner::Impl {
                         RCLCPP_INFO(logger, "local replan success");
                         current_traj_.traj_pieces = std::move(pieces);
                         has_traj_ = true;
+                        pub_traj(current_traj_);
                     } else {
                         fsm_ = FSMSTATE::SEARCH_PATH;
                     }

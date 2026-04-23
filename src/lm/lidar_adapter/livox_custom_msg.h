@@ -21,7 +21,7 @@ public:
     inline void setup_subscription(
         rclcpp::Node* node,
         const std::string& topic,
-        std::function<void(const std::vector<common::Point>&, const rclcpp::Time&)> callback
+        std::function<void(std::vector<common::Point>&, const rclcpp::Time&)> callback
     ) override {
         subscription = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
             topic,
