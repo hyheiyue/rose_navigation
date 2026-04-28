@@ -6,9 +6,11 @@
 #include "lidar_adapter/livox_pointcloud2.h"
 #include "lidar_adapter/unitree_lidar.h"
 #include "lidar_adapter/velodyne_pointcloud2.h"
+#include "lm/common.hpp"
 #include "lm/lidar_adapter/base_lidar.h"
 #include "param_deliver.h"
 #include "utils/io/pcd_io.h"
+#include "utils/lock_queue.hpp"
 #include "utils/mapping/pcd_mapping.h"
 #include "utils/rcl_tf.hpp"
 #include "utils/rclcpp_parameter_node.hpp"
@@ -39,6 +41,7 @@
 #include <tbb/parallel_sort.h>
 #include <tf2/LinearMath/Transform.hpp>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 //ros2 service call /map_save std_srvs/srv/Trigger
@@ -285,6 +288,7 @@ struct SmallPointLIO::Impl {
                 );
             }
         }
+        output_thread_ = std::thread(std::bind(&SmallPointLIO::Impl::output_loop, this));
         marker_pub_ =
             node_->create_publisher<visualization_msgs::msg::MarkerArray>("/lm_marker", 10);
         odom_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 1000);
@@ -521,12 +525,12 @@ struct SmallPointLIO::Impl {
             odometry.velocity = estimator_->kf.x.velocity.cast<double>();
             odometry.orientation = estimator_->kf.x.rotation.cast<double>();
             odometry.angular_velocity = estimator_->kf.x.omg.cast<double>();
+            output_deque_.push(std::make_pair(odometry, pointcloud_odom_frame));
+            // publish_odometry(odometry);
 
-            publish_odometry(odometry);
-
-            if (!pointcloud_odom_frame.empty()) {
-                publish_pointCloud(pointcloud_odom_frame);
-            }
+            // if (!pointcloud_odom_frame.empty()) {
+            //     publish_pointCloud(pointcloud_odom_frame);
+            // }
 
             pointcloud_odom_frame.clear();
         }
@@ -548,7 +552,16 @@ struct SmallPointLIO::Impl {
             std::chrono::duration<double>(1.0)
         );
     }
-
+    void output_loop() {
+        while (rclcpp::ok()) {
+            std::pair<common::Odometry, std::vector<Eigen::Vector3f>> output;
+            output_deque_.wait_and_pop(output);
+            publish_odometry(output.first);
+            if (!output.second.empty()) {
+                publish_pointCloud(output.second);
+            }
+        }
+    }
     common::Odometry last_odometry_;
     void publish_pointCloud(const std::vector<Eigen::Vector3f>& pointcloud) {
         if (utils::publisher_sub(pointcloud_pub_)) {
@@ -706,7 +719,9 @@ struct SmallPointLIO::Impl {
             auto robot_to_base_opt = tf_->get_tf2_transform(
                 params_.robot_base_frame,
                 params_.base_frame,
-                time_msg,
+                time_msg
+
+                ,
                 rclcpp::Duration::from_seconds(0.1)
             );
             if (robot_to_base_opt) {
@@ -1023,6 +1038,9 @@ struct SmallPointLIO::Impl {
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_trigger_;
     Eigen::Matrix<state::value_type, state::DIM, state::DIM> Q;
     RclTF::Ptr tf_;
+    std::thread output_thread_;
+    LockQueue<std::pair<common::Odometry, std::vector<Eigen::Vector3f>>> output_deque_;
+
     std::unique_ptr<utils::PCDMapping> pcd_mapping;
     Eigen::Isometry3d lidar_to_robot_init_;
     tf2::Transform lidar_odom_to_odom_tf2_;
