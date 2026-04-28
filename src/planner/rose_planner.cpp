@@ -354,13 +354,13 @@ struct RosePlanner::Impl {
             pub_raw_path(new_raw_path);
 
             current_traj_.set_raw_path(new_raw_path);
-            current_traj_.resample(params_.sample_ds);
+            current_traj_.resample(params_.sample_ds,params_.sample_ds / params_.expected_speed);
 
             std::vector<Piece<5, 2>> pieces;
-
+            
             pieces = traj_opt_->optimize(
                 current_traj_.sampled_,
-                params_.sample_ds / params_.expected_speed,
+                current_traj_.sampled_dt_,
                 no_opt_range
             );
 
@@ -498,7 +498,7 @@ struct RosePlanner::Impl {
                         current_traj_.get_sampled_idx_by_traj_pieces_idx(end_traj_piece_idx);
                     auto pieces = traj_opt_->optimize(
                         current_traj_.sampled_,
-                        params_.sample_ds / params_.expected_speed,
+                        current_traj_.sampled_dt_,
                         std::make_pair(0, end_sampled_idx)
                     );
 

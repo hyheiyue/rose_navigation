@@ -9,6 +9,7 @@
 //clang-format on
 namespace rose_nav::planner {
 struct LMPC::Impl {
+    enum class MotionModel { OMNI, DIFF };
     struct Params {
         double predict_dt = 0.1;
         int max_iter = 100;
@@ -17,9 +18,9 @@ struct LMPC::Impl {
         double max_accel = 1.0;
         double delay_time = 0.0;
         double blind_radius;
-        std::vector<double> Q = { 15.0, 15.0, 0.5, 0.5 };
-        std::vector<double> Rd = { 1.0, 0.05 };
-        std::vector<double> R = { 0.1, 0.1 };
+        std::vector<double> Q_omni = { 15.0, 15.0, 0.5, 0.5 };
+        std::vector<double> Rd_omni = { 1.0, 0.05 };
+        std::vector<double> R_omni = { 0.1, 0.1 };
         void load(const ParamsNode& config) {
             predict_dt = config.declare<double>("predict_dt");
             max_iter = config.declare<int>("max_iter");
@@ -28,18 +29,18 @@ struct LMPC::Impl {
             max_accel = config.declare<double>("max_accel");
             delay_time = config.declare<double>("delay_time");
             blind_radius = config.declare<double>("blind_radius");
-            Q = config.declare<std::vector<double>>("Q");
-            Rd = config.declare<std::vector<double>>("Rd");
-            R = config.declare<std::vector<double>>("R");
+            Q_omni = config.declare<std::vector<double>>("Q_omni");
+            Rd_omni = config.declare<std::vector<double>>("Rd_omni");
+            R_omni = config.declare<std::vector<double>>("R_omni");
         }
     } params_;
     Impl(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
         rose_map_ = rose_map;
         params_.load(config);
-        xref_ = Eigen::MatrixXd::Zero(4, params_.predict_steps + 1);
-        dref_ = Eigen::MatrixXd::Zero(2, params_.predict_steps + 1);
-        output_ = Eigen::MatrixXd::Zero(2, params_.predict_steps + 1);
-        last_output_ = output_;
+        omni_.xref = Eigen::MatrixXd::Zero(4, params_.predict_steps + 1);
+        omni_.dref = Eigen::MatrixXd::Zero(2, params_.predict_steps + 1);
+        omni_.output = Eigen::MatrixXd::Zero(2, params_.predict_steps + 1);
+        omni_.last_output = omni_.output;
         xbar_.resize(params_.predict_steps + 1);
     }
     void set_traj(const Traj& traj) {
@@ -55,7 +56,6 @@ struct LMPC::Impl {
         return rose_map_->esdf()->get_esdf(pos.cast<float>());
     }
     bool get_re(const int T_in, double dt_in) {
-    ws:
         P_.clear();
         P_.reserve(T_in);
 
@@ -122,16 +122,18 @@ struct LMPC::Impl {
         s.vel.x() = vx_cmd;
         s.vel.y() = vy_cmd;
     }
+
     void predict_motion() {
         xbar_[0] = now_state_w_;
         RoboState temp = now_state_w_;
 
-        for (int i = 1; i <= params_.predict_steps; i++) {
-            state_trans_omni(temp, output_(0, i - 1), output_(1, i - 1));
+        for (int i = 1; i <= params_.predict_steps; ++i) {
+            state_trans_omni(temp, omni_.output(0, i - 1), omni_.output(1, i - 1));
+
             xbar_[i] = temp;
         }
     }
-    void solve_mpc() {
+    void solve_mpc_omni() {
         const int steps = params_.predict_steps;
         const double dt = params_.predict_dt;
 
@@ -144,26 +146,26 @@ struct LMPC::Impl {
         const int dimu = 2 * steps; // vx vy
         const int nx = dimx + dimu;
 
-        qp_gradient_.setZero(nx);
+        omni_.qp_gradient.setZero(nx);
 
-        const auto Q = params_.Q;
-        const auto R = params_.R;
-        const auto Rd = params_.Rd;
+        const auto Q = params_.Q_omni;
+        const auto R = params_.R_omni;
+        const auto Rd = params_.Rd_omni;
 
         /* ---------------- cost gradient ---------------- */
 
         for (int i = 0; i < steps; ++i) {
             int xi = 2 * i;
 
-            qp_gradient_[xi + 0] = -2.0 * Q[0] * xref_(0, i);
-            qp_gradient_[xi + 1] = -2.0 * Q[1] * xref_(1, i);
+            omni_.qp_gradient[xi + 0] = -2.0 * Q[0] * omni_.xref(0, i);
+            omni_.qp_gradient[xi + 1] = -2.0 * Q[1] * omni_.xref(1, i);
         }
 
         for (int i = 0; i < steps; ++i) {
             int ui = dimx + 2 * i;
 
-            qp_gradient_[ui + 0] = -2.0 * R[0] * dref_(0, i);
-            qp_gradient_[ui + 1] = -2.0 * R[1] * dref_(1, i);
+            omni_.qp_gradient[ui + 0] = -2.0 * R[0] * omni_.dref(0, i);
+            omni_.qp_gradient[ui + 1] = -2.0 * R[1] * omni_.dref(1, i);
         }
 
         /* ---------------- Hessian ---------------- */
@@ -215,9 +217,9 @@ struct LMPC::Impl {
             H_trip.emplace_back(up + 1, ui + 1, -2.0 * Rd[1]);
         }
 
-        qp_hessian_.resize(nx, nx);
-        qp_hessian_.setFromTriplets(H_trip.begin(), H_trip.end());
-        qp_hessian_.makeCompressed();
+        omni_.qp_hessian.resize(nx, nx);
+        omni_.qp_hessian.setFromTriplets(H_trip.begin(), H_trip.end());
+        omni_.qp_hessian.makeCompressed();
 
         /* ---------------- constraints ---------------- */
 
@@ -227,27 +229,27 @@ struct LMPC::Impl {
 
         const int nc = dyn_rows + speed_rows + smooth_rows;
 
-        qp_lowerBound_.setConstant(nc, -1e10);
-        qp_upperBound_.setConstant(nc, 1e10);
+        omni_.qp_lowerBound.setConstant(nc, -1e10);
+        omni_.qp_upperBound.setConstant(nc, 1e10);
 
         /* initial state */
 
         Eigen::Vector2d x0;
         x0 << now_state_w_.pos.x(), now_state_w_.pos.y();
 
-        qp_lowerBound_.segment(0, 2) = x0;
-        qp_upperBound_.segment(0, 2) = x0;
+        omni_.qp_lowerBound.segment(0, 2) = x0;
+        omni_.qp_upperBound.segment(0, 2) = x0;
 
         /* dynamics rows */
 
         for (int i = 1; i < steps; ++i) {
             int r = 2 * i;
 
-            qp_lowerBound_[r + 0] = 0.0;
-            qp_upperBound_[r + 0] = 0.0;
+            omni_.qp_lowerBound[r + 0] = 0.0;
+            omni_.qp_upperBound[r + 0] = 0.0;
 
-            qp_lowerBound_[r + 1] = 0.0;
-            qp_upperBound_[r + 1] = 0.0;
+            omni_.qp_lowerBound[r + 1] = 0.0;
+            omni_.qp_upperBound[r + 1] = 0.0;
         }
 
         /* velocity bounds */
@@ -259,11 +261,11 @@ struct LMPC::Impl {
         for (int i = 0; i < steps; ++i) {
             int r = offset + 2 * i;
 
-            qp_lowerBound_[r + 0] = -max_speed;
-            qp_upperBound_[r + 0] = max_speed;
+            omni_.qp_lowerBound[r + 0] = -max_speed;
+            omni_.qp_upperBound[r + 0] = max_speed;
 
-            qp_lowerBound_[r + 1] = -max_speed;
-            qp_upperBound_[r + 1] = max_speed;
+            omni_.qp_lowerBound[r + 1] = -max_speed;
+            omni_.qp_upperBound[r + 1] = max_speed;
         }
 
         /* velocity change */
@@ -275,16 +277,16 @@ struct LMPC::Impl {
         for (int i = 1; i < steps; ++i) {
             int r = offset + 2 * (i - 1);
 
-            qp_lowerBound_[r + 0] = -max_dv;
-            qp_upperBound_[r + 0] = max_dv;
+            omni_.qp_lowerBound[r + 0] = -max_dv;
+            omni_.qp_upperBound[r + 0] = max_dv;
 
-            qp_lowerBound_[r + 1] = -max_dv;
-            qp_upperBound_[r + 1] = max_dv;
+            omni_.qp_lowerBound[r + 1] = -max_dv;
+            omni_.qp_upperBound[r + 1] = max_dv;
         }
 
         /* ---------------- A matrix ---------------- */
 
-        if (!solver_initialized_) {
+        if (!omni_.solver_initialized) {
             Eigen::SparseMatrix<double> A(nc, nx);
             std::vector<Eigen::Triplet<double>> A_trip;
 
@@ -342,40 +344,39 @@ struct LMPC::Impl {
             A.setFromTriplets(A_trip.begin(), A_trip.end());
             A.makeCompressed();
 
-            A_cache_ = A;
+            omni_.A_cache = A;
 
-            solver_.settings()->setWarmStart(true);
-            solver_.settings()->setAdaptiveRho(true);
-            solver_.settings()->setMaxIteration(2000);
-            solver_.settings()->setAbsoluteTolerance(1e-4);
-            solver_.settings()->setRelativeTolerance(1e-4);
-            solver_.settings()->setVerbosity(false);
+            omni_.solver.settings()->setWarmStart(true);
+            omni_.solver.settings()->setAdaptiveRho(true);
+            omni_.solver.settings()->setMaxIteration(2000);
+            omni_.solver.settings()->setAbsoluteTolerance(1e-4);
+            omni_.solver.settings()->setRelativeTolerance(1e-4);
+            omni_.solver.settings()->setVerbosity(false);
 
-            solver_.data()->setNumberOfVariables(nx);
-            solver_.data()->setNumberOfConstraints(nc);
+            omni_.solver.data()->setNumberOfVariables(nx);
+            omni_.solver.data()->setNumberOfConstraints(nc);
 
-            solver_.data()->setLinearConstraintsMatrix(A_cache_);
-            solver_.data()->setHessianMatrix(qp_hessian_);
-            solver_.data()->setGradient(qp_gradient_);
-            solver_.data()->setLowerBound(qp_lowerBound_);
-            solver_.data()->setUpperBound(qp_upperBound_);
+            omni_.solver.data()->setLinearConstraintsMatrix(omni_.A_cache);
+            omni_.solver.data()->setHessianMatrix(omni_.qp_hessian);
+            omni_.solver.data()->setGradient(omni_.qp_gradient);
+            omni_.solver.data()->setLowerBound(omni_.qp_lowerBound);
+            omni_.solver.data()->setUpperBound(omni_.qp_upperBound);
 
-            if (!solver_.initSolver()) {
+            if (!omni_.solver.initSolver()) {
                 std::cerr << "[OSQP] init failed\n";
                 return;
             }
 
-            solver_initialized_ = true;
+            omni_.solver_initialized = true;
         }
 
-        solver_.updateHessianMatrix(qp_hessian_);
-        solver_.updateGradient(qp_gradient_);
-        solver_.updateBounds(qp_lowerBound_, qp_upperBound_);
+        omni_.solver.updateHessianMatrix(omni_.qp_hessian);
+        omni_.solver.updateGradient(omni_.qp_gradient);
+        omni_.solver.updateBounds(omni_.qp_lowerBound, omni_.qp_upperBound);
 
-        solver_.solveProblem();
+        omni_.solver.solveProblem();
 
-        Eigen::VectorXd sol = solver_.getSolution();
-
+        Eigen::VectorXd sol = omni_.solver.getSolution();
         if (!sol.allFinite()) {
             std::cerr << "[OSQP] solution invalid\n";
             return;
@@ -386,24 +387,26 @@ struct LMPC::Impl {
         for (int i = 0; i < steps; ++i) {
             int ui = dimx + 2 * i;
 
-            output_(0, i) = sol[ui + 0];
-            output_(1, i) = sol[ui + 1];
+            omni_.output(0, i) = sol[ui + 0];
+            omni_.output(1, i) = sol[ui + 1];
         }
     }
-
     std::optional<ControlOutput> solve(std::chrono::duration<double> dt) {
+        return solve_omni(dt);
+    }
+    std::optional<ControlOutput> solve_omni(std::chrono::duration<double> dt) {
         P_.clear();
         if (!get_re(params_.predict_steps, params_.predict_dt)) {
             RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "get_ref failed");
             return std::nullopt;
         }
         for (int i = 0; i < P_.size(); i++) {
-            xref_(0, i) = P_[i].pos.x();
-            xref_(1, i) = P_[i].pos.y();
-            xref_(2, i) = P_[i].vel.x();
-            xref_(3, i) = P_[i].vel.y();
-            dref_(0, i) = P_[i].vel.x();
-            dref_(1, i) = P_[i].vel.y();
+            omni_.xref(0, i) = P_[i].pos.x();
+            omni_.xref(1, i) = P_[i].pos.y();
+            omni_.xref(2, i) = P_[i].vel.x();
+            omni_.xref(3, i) = P_[i].vel.y();
+            omni_.dref(0, i) = P_[i].vel.x();
+            omni_.dref(1, i) = P_[i].vel.y();
         }
         const auto t_start = std::chrono::steady_clock::now();
         for (int iter = 0; iter < params_.max_iter; ++iter) {
@@ -415,9 +418,9 @@ struct LMPC::Impl {
             }
             if (iter > 0) {
                 double du = 0.0;
-                for (int c = 0; c < output_.cols(); ++c) {
-                    du += std::fabs(output_(0, c) - last_output_(0, c));
-                    du += std::fabs(output_(1, c) - last_output_(1, c));
+                for (int c = 0; c < omni_.output.cols(); ++c) {
+                    du += std::fabs(omni_.output(0, c) - omni_.last_output(0, c));
+                    du += std::fabs(omni_.output(1, c) - omni_.last_output(1, c));
                 }
                 if (du < 1e-4) {
                     break;
@@ -425,11 +428,11 @@ struct LMPC::Impl {
             }
 
             predict_motion();
-            last_output_ = output_;
-            solve_mpc();
+            omni_.last_output = omni_.output;
+            solve_mpc_omni();
         }
         ControlOutput o;
-        o.vel = Eigen::Vector2d(output_(0, 0), output_(1, 0));
+        o.vel = Eigen::Vector2d(omni_.output(0, 0), omni_.output(1, 0));
         o.pred_states = xbar_;
         return std::make_optional(o);
     }
@@ -437,27 +440,23 @@ struct LMPC::Impl {
     Traj traj_;
     RoboState now_state_w_;
     std::vector<RoboState> xbar_;
-    Eigen::MatrixXd A_, B_;
-    Eigen::VectorXd C_;
-    Eigen::MatrixXd xref_;
-    Eigen::MatrixXd dref_;
-    Eigen::MatrixXd output_;
-    Eigen::MatrixXd last_output_;
-    Eigen::VectorXd last_solution_;
-    bool has_last_solution_ = false;
     std::vector<TrajPoint> P_;
-    OsqpEigen::Solver solver_;
-    Eigen::VectorXd qp_gradient_;
-    Eigen::VectorXd qp_lowerBound_;
-    Eigen::VectorXd qp_upperBound_;
-    Eigen::SparseMatrix<double> qp_hessian_;
-    Eigen::SparseMatrix<double> A_cache_;
-    int qp_nx_ = 0;
-    int qp_nc_ = 0;
-    bool solver_initialized_ = false;
-    int A_rows_cached_ = 0;
-    int A_cols_cached_ = 0;
+    struct Ctx {
+        Eigen::MatrixXd xref;
+        Eigen::MatrixXd dref;
+        Eigen::MatrixXd output;
+        Eigen::MatrixXd last_output;
+        OsqpEigen::Solver solver;
+        Eigen::VectorXd qp_gradient;
+        Eigen::VectorXd qp_lowerBound;
+        Eigen::VectorXd qp_upperBound;
+        Eigen::SparseMatrix<double> qp_hessian;
+        Eigen::SparseMatrix<double> A_cache;
+        bool solver_initialized = false;
+    };
+    Ctx omni_;
     map::RoseMap::Ptr rose_map_;
+    MotionModel motion_model_ = MotionModel::OMNI;
 };
 LMPC::LMPC(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
     _impl = std::make_unique<Impl>(rose_map, config);

@@ -16,6 +16,7 @@ struct RoboState {
     Eigen::Vector2d pos;
     Eigen::Vector2d vel;
     double yaw;
+    double w;
 };
 class Robo {
 public:

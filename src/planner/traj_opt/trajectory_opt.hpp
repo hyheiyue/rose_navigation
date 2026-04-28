@@ -17,7 +17,7 @@ public:
     ~TrajOpt();
     std::vector<Piece<5, 2>> optimize(
         const std::vector<Traj::SampledPoint>& sampled,
-        double dt,
+        const std::vector<double> sampled_dt,
         std::optional<std::pair<int, int>> some_no_opt = std::nullopt
     );
     struct Impl;

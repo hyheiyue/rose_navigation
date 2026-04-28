@@ -219,7 +219,7 @@ struct TrajOpt::Impl {
 
     std::vector<Piece<5, 2>> optimize(
         const std::vector<Traj::SampledPoint>& sampled,
-        double dt,
+        const std::vector<double> sampled_dt,
         std::optional<std::pair<int, int>> some_no_opt = std::nullopt
     ) {
         if (sampled.size() < 5) {
@@ -285,7 +285,7 @@ struct TrajOpt::Impl {
 
         in_times_.resize(piece_num);
         for (int i = 0; i < piece_num; ++i) {
-            in_times_(i) = dt;
+            in_times_(i) = sampled_dt[i];
         }
 
         double min_cost = 0.0;
@@ -422,9 +422,9 @@ TrajOpt::~TrajOpt() {
 }
 std::vector<Piece<5, 2>> TrajOpt::optimize(
     const std::vector<Traj::SampledPoint>& sampled,
-    double dt,
+    const std::vector<double> sampled_dt,
     std::optional<std::pair<int, int>> some_no_opt
 ) {
-    return _impl->optimize(sampled, dt, some_no_opt);
+    return _impl->optimize(sampled, sampled_dt, some_no_opt);
 }
 } // namespace rose_nav::planner

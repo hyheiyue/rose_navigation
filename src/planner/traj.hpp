@@ -24,7 +24,7 @@ public:
         raw_s_ = compute_arc_lengths(raw_path_);
     }
 
-    inline void resample(double sample_ds) {
+    inline void resample(double sample_ds,double sampled_dt) {
         if (raw_path_.size() < 2)
             return;
 
@@ -49,6 +49,10 @@ public:
             int idx = sampled_.size();
             sampled_.push_back(sp);
             raw_to_sampled_[n].push_back(idx);
+        }
+        sampled_dt_.resize(sampled_.size() - 1);
+        for (size_t i = 0; i < sampled_dt_.size(); ++i) {
+            sampled_dt_[i] = sampled_dt;
         }
     }
     inline double get_traj_total_duration() const {
@@ -110,12 +114,10 @@ public:
         return std::make_pair(best_t, min_dis);
     }
 
-    // raw -> sampled（O(1)）
     inline const std::vector<int>& get_sampled_from_raw(int raw_idx) const noexcept {
         return raw_to_sampled_[raw_idx];
     }
 
-    // 找某个 raw 点对应最近的 sampled 点（基于弧长）
     inline int find_nearest_sampled_of_raw(int raw_idx) const noexcept {
         double s_q = raw_s_[raw_idx];
 
@@ -196,6 +198,7 @@ public:
     std::vector<std::vector<int>> raw_to_sampled_;
 
     std::vector<SampledPoint> sampled_;
+    std::vector<double> sampled_dt_; // sampled 的时间间隔
 
     std::vector<Piece<5, 2>> traj_pieces; //size == sampled_.size() -1
 };
