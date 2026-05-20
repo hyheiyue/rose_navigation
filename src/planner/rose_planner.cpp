@@ -10,19 +10,23 @@
 #include <Eigen/src/Core/Matrix.h>
 #include <Eigen/src/Geometry/Transform.h>
 #include <algorithm>
+#include <deque>
 #include <memory>
+#include <nav_msgs/msg/detail/path__struct.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <numeric>
 #include <optional>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
+#include <rclcpp/time.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <string>
 #include <sys/types.h>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <visualization_msgs/msg/detail/marker_array__struct.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 namespace rose_nav::planner {
 struct RosePlanner::Impl {
@@ -41,6 +45,8 @@ struct RosePlanner::Impl {
         double sample_ds;
         double expected_speed;
         double check_safe_horizon;
+        double check_turtle_front;
+        double check_turtle_back;
         void load(const ParamsNode& config) {
             robot_radius = config.declare<double>("robot_radius");
             target_frame = config.declare<std::string>("target_frame");
@@ -49,6 +55,8 @@ struct RosePlanner::Impl {
             sample_ds = config.declare<double>("sample_ds");
             expected_speed = config.declare<double>("expected_speed");
             check_safe_horizon = config.declare<double>("check_safe_horizon");
+            check_turtle_front = config.declare<double>("check_turtle_front");
+            check_turtle_back = config.declare<double>("check_turtle_back");
         }
     } params_;
     Impl(rclcpp::Node& node) {
@@ -172,6 +180,26 @@ struct RosePlanner::Impl {
                 set_goal(p.head<2>());
             }
         );
+        tunnel_sub_ = node.create_subscription<geometry_msgs::msg::PointStamped>(
+            "tunnel",
+            10,
+            [this](const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+                static Eigen::Isometry3d target_2_msg = Eigen::Isometry3d::Identity();
+                auto target_2_msg_opt = tf_->get_transform<double>(
+                    params_.target_frame,
+                    msg->header.frame_id,
+                    msg->header.stamp,
+                    rclcpp::Duration::from_seconds(0.1)
+                );
+                if (target_2_msg_opt) {
+                    target_2_msg = *target_2_msg_opt;
+                }
+                Eigen::Vector4d p(msg->point.x, msg->point.y, msg->point.z, 1.0f);
+                p = target_2_msg * p;
+                Tunnel t { .p = p.head<2>() };
+                tunnels_.push_back(t);
+            }
+        );
 
         predict_path_pub_ = node.create_publisher<nav_msgs::msg::Path>("predict_path", 10);
         cmd_vel_pub_ = node.create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
@@ -182,8 +210,11 @@ struct RosePlanner::Impl {
 
         raw_path_pub_ = node.create_publisher<nav_msgs::msg::Path>("raw_path", 10);
         opt_path_pub_ = node.create_publisher<nav_msgs::msg::Path>("opt_path", 10);
+        old_path_pub_ = node.create_publisher<nav_msgs::msg::Path>("old_path", 10);
         opt_marker_pub_ =
             node.create_publisher<visualization_msgs::msg::Marker>("/opt_traj_marker", 10);
+        tunnel_marker_pub_ =
+            node.create_publisher<visualization_msgs::msg::MarkerArray>("/tunnel_marker", 10);
         auto plan_fps = config.declare<double>("plan_fps");
         plan_thread_ = std::thread([this, plan_fps]() {
             auto next_tp = std::chrono::steady_clock::now();
@@ -248,7 +279,8 @@ struct RosePlanner::Impl {
                 geometry_msgs::msg::Twist cmd;
                 cmd.linear.x = 0.0;
                 cmd.linear.y = 0.0;
-                cmd.angular.z = 0.0;
+                cmd.linear.z = need_turtle_ ? 100 : -100;
+                cmd.angular.z = params_.default_wz;
                 cmd_vel_pub_->publish(cmd);
             }
             return;
@@ -270,7 +302,8 @@ struct RosePlanner::Impl {
                         geometry_msgs::msg::Twist cmd;
                         cmd.linear.x = 0.0;
                         cmd.linear.y = 0.0;
-                        cmd.angular.z = 0.0;
+                        cmd.linear.z = need_turtle_ ? 100 : -100;
+                        cmd.angular.z = params_.default_wz;
                         cmd_vel_pub_->publish(cmd);
                     }
 
@@ -296,7 +329,7 @@ struct RosePlanner::Impl {
                 geometry_msgs::msg::Twist cmd;
                 cmd.linear.x = vx_body;
                 cmd.linear.y = vy_body;
-
+                cmd.linear.z = need_turtle_ ? 100 : -100;
                 cmd.angular.z = params_.default_wz;
                 cmd_vel_pub_->publish(cmd);
                 std_msgs::msg::Float64 cmd_norm;
@@ -317,8 +350,33 @@ struct RosePlanner::Impl {
         }
     }
     void plan_callback() {
+        pub_tunnel();
         auto logger = rclcpp::get_logger("rose_nav:planner");
+        auto current = robo_->get_now_state();
+        OldPos o { .pos = current.pos, .time = node_->now() };
+        old_positions_.push_back(o);
+        while (old_positions_.size() > 2
+               && (old_positions_.back().time - old_positions_.front().time)
+                   > rclcpp::Duration::from_seconds(params_.check_turtle_back))
+        {
+            old_positions_.pop_front();
+        }
+        nav_msgs::msg::Path old_path;
 
+        old_path.header.stamp = node_->now();
+        old_path.header.frame_id = params_.target_frame;
+        if (old_path_pub_->get_subscription_count() > 0) {
+            for (int i = 0; i < (int)old_positions_.size(); i++) {
+                geometry_msgs::msg::PoseStamped pose_msg;
+                pose_msg.header = old_path.header;
+                pose_msg.pose.position.x = old_positions_[i].pos.x();
+                pose_msg.pose.position.y = old_positions_[i].pos.y();
+                pose_msg.pose.position.z = 0.0;
+
+                old_path.poses.push_back(pose_msg);
+            }
+            old_path_pub_->publish(old_path);
+        }
         auto reached = [&](double dist_to_goal) {
             RCLCPP_INFO(logger, "Goal reached (dist=%.2f m), go to next goal", dist_to_goal);
             goal_.pos.pop_front();
@@ -354,10 +412,10 @@ struct RosePlanner::Impl {
             pub_raw_path(new_raw_path);
 
             current_traj_.set_raw_path(new_raw_path);
-            current_traj_.resample(params_.sample_ds,params_.sample_ds / params_.expected_speed);
+            current_traj_.resample(params_.sample_ds, params_.sample_ds / params_.expected_speed);
 
             std::vector<Piece<5, 2>> pieces;
-            
+
             pieces = traj_opt_->optimize(
                 current_traj_.sampled_,
                 current_traj_.sampled_dt_,
@@ -448,6 +506,23 @@ struct RosePlanner::Impl {
                         last_unsafe_traj_time = t;
                     }
                 }
+                need_turtle_ = false;
+                double check_turtle_end_time =
+                    std::min(now_t_in_traj + params_.check_turtle_front, total_duration);
+                for (double t = now_t_in_traj; t <= check_turtle_end_time; t += sample_dt) {
+                    if (is_in_tunnel(current_traj_.get_traj_pos_by_time(t))) {
+                        need_turtle_ = true;
+                    }
+                }
+                for (const auto& old_pos: old_positions_) {
+                    if (is_in_tunnel(old_pos.pos)) {
+                        need_turtle_ = true;
+                    }
+                }
+                if (need_turtle_) {
+                    RCLCPP_INFO(logger, "need turtle");
+                }
+                mpc_->set_need_turtle(need_turtle_);
 
                 if (last_unsafe_raw_idx != -1) {
                     RCLCPP_INFO(
@@ -479,7 +554,7 @@ struct RosePlanner::Impl {
                     }
 
                     break;
-                } else if (last_unsafe_traj_time >= 0) {
+                } else if (last_unsafe_traj_time >= 0.01) {
                     last_how_to_replan = repaln_by_traj;
                     RCLCPP_INFO(
                         logger,
@@ -519,6 +594,17 @@ struct RosePlanner::Impl {
             }
         }
     }
+    bool is_in_tunnel(const Eigen::Vector2d& pos) {
+        for (const auto& tunnel: tunnels_) {
+            if (tunnel.is_in_tunnel(pos)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // void check_turtle(){
+
+    // }
     std::vector<Eigen::Vector2d>
     search_once(const Eigen::Vector2d& start, const Eigen::Vector2d& goal) {
         auto [path, search_state] = search(start, goal);
@@ -638,7 +724,14 @@ struct RosePlanner::Impl {
             opt_marker_pub_->publish(marker);
         }
     }
-
+    void pub_tunnel() {
+        visualization_msgs::msg::MarkerArray m;
+        int id = 1;
+        for (const auto& tunnel: tunnels_) {
+            tunnel.fill_marker(m, id++);
+        }
+        tunnel_marker_pub_->publish(m);
+    }
     rclcpp::Node* node_;
 
     FSMSTATE fsm_;
@@ -650,7 +743,12 @@ struct RosePlanner::Impl {
     RclTF::Ptr tf_;
     Goal goal_buf_;
     Goal goal_;
-
+    struct OldPos {
+        Eigen::Vector2d pos;
+        rclcpp::Time time;
+    };
+    std::deque<OldPos> old_positions_;
+    std::vector<Tunnel> tunnels_;
     enum class GoalMode : u_int8_t {
         SINGALE = 0,
         MULTI = 1,
@@ -661,15 +759,18 @@ struct RosePlanner::Impl {
     double control_fps_;
     Traj current_traj_;
     bool has_traj_;
-
+    bool need_turtle_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr goal_point_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr tunnel_sub_;
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raw_path_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr opt_path_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr opt_marker_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr tunnel_marker_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr predict_path_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr old_path_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr cmd_vel_norm_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr vel_marker_pub_;

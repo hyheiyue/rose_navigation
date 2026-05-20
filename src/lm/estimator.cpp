@@ -66,10 +66,12 @@ void Estimator::reset() {
             );
         }
     }
+    kf.x.reset();
     kf.P = Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Identity() * 0.01;
     kf.P.block<3, 3>(state::gravity_index, state::gravity_index).diagonal().fill(0.0001);
     kf.P.block<3, 3>(state::bg_index, state::bg_index).diagonal().fill(0.001);
     kf.P.block<3, 3>(state::ba_index, state::ba_index).diagonal().fill(0.001);
+    is_inited = false;
 }
 
 [[nodiscard]] Eigen::Matrix<state::value_type, state::DIM, state::DIM>

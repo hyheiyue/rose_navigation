@@ -293,7 +293,112 @@ struct RoseMap::Impl {
             } while (0);
         }
     }
+    // void bin_callback(BinMap* bin) noexcept {
+    //     if (has_added_static_) {
+    //         return;
+    //     }
 
+    //     auto& bin_voxel = bin->voxel_map_;
+    //     auto voxel_3d = occ_map_->get_voxel_map();
+
+    //     static std::unique_ptr<SlidingVoxelMap<2, float>> slope_map;
+
+    //     constexpr double _diff = -0.5;
+
+    //     if (!slope_map) {
+    //         auto max_k_3d = voxel_3d->max_key;
+    //         auto max_p_3d = voxel_3d->key_to_world(max_k_3d);
+    //         auto min_k_3d = voxel_3d->min_key;
+    //         auto min_p_3d = voxel_3d->key_to_world(min_k_3d);
+
+    //         min_p_3d.x() += _diff;
+    //         min_p_3d.y() += _diff;
+    //         max_p_3d.x() -= _diff;
+    //         max_p_3d.y() -= _diff;
+
+    //         slope_map = std::make_unique<SlidingVoxelMap<2, float>>(
+    //             bin_map_->voxel_map_->voxel_size,
+    //             min_p_3d.head<2>(),
+    //             max_p_3d.head<2>(),
+    //             true
+    //         );
+    //     }
+
+    //     slope_map->slide_to(
+    //         slope_map->world_to_key(voxel_3d->get_center().head<2>()),
+    //         [&](int idx) {
+    //             // 可选：清理逻辑
+    //         }
+    //     );
+
+    //     auto occupied_idxs_3d = occ_map_->get_occupied_idx();
+    //     if (occupied_idxs_3d.empty()) {
+    //         return;
+    //     }
+
+    //     auto pointcloud = std::make_shared<small_gicp::PointCloud>();
+    //     pointcloud->resize(occupied_idxs_3d.size());
+
+    //     for (size_t i = 0; i < occupied_idxs_3d.size(); i++) {
+    //         auto w3d = voxel_3d->index_to_world(occupied_idxs_3d[i]);
+    //         pointcloud->point(i) << w3d.cast<double>(), 1.0;
+    //     }
+
+    //     double robo_z = voxel_3d->get_center().z();
+    //     double min_z = robo_z + bin_params_.bottom_z_to_robo_z;
+    //     double max_z = robo_z + bin_params_.top_z_to_robo_z;
+
+    //     std::vector<float> min_z_map(slope_map->grid.size(), std::numeric_limits<float>::max());
+    //     std::vector<float> max_z_map(slope_map->grid.size(), std::numeric_limits<float>::lowest());
+    //     std::vector<int> count(slope_map->grid.size(), 0);
+
+    //     for (size_t i = 0; i < pointcloud->size(); ++i) {
+    //         const auto& pt = pointcloud->point(i);
+
+    //         if (!std::isfinite(pt.x()) || !std::isfinite(pt.y()) || !std::isfinite(pt.z()))
+    //             continue;
+
+    //         if (pt.z() < min_z || pt.z() > max_z)
+    //             continue;
+
+    //         int idx2d = slope_map->world_to_index(Eigen::Vector2f(pt.x(), pt.y()));
+    //         if (idx2d < 0)
+    //             continue;
+
+    //         float z = static_cast<float>(pt.z());
+
+    //         min_z_map[idx2d] = std::min(min_z_map[idx2d], z);
+    //         max_z_map[idx2d] = std::max(max_z_map[idx2d], z);
+    //         count[idx2d]++;
+    //     }
+
+    //     for (auto it = bin_voxel->grid.begin(); it != bin_voxel->grid.end();) {
+    //         if (!it->second.is_static) {
+    //             it = bin_voxel->grid.erase(it);
+    //         } else {
+    //             ++it;
+    //         }
+    //     }
+
+    //     for (int i = 0; i < slope_map->grid.size(); ++i) {
+    //         if (count[i] <= bin_params_.count_thresh)
+    //             continue;
+
+    //         float dz = max_z_map[i] - min_z_map[i];
+
+    //         auto p = slope_map->index_to_world(i);
+    //         auto it = bin_voxel->get_cell(p);
+
+    //         // 已经是静态则跳过
+    //         if (it && it->is_static)
+    //             continue;
+
+    //         // // ====== 用高度差判断坡度 ======
+    //         // if (dz > bin_params_.height_diff_thresh) {
+    //         bin_voxel->set_cell(p, BinMap::Cell { .is_static = false });
+    //         // }
+    //     }
+    // }
     void bin_callback(BinMap* bin) noexcept {
         if (has_added_static_) {
             return;
@@ -347,7 +452,7 @@ struct RoseMap::Impl {
             const auto& n = pointcloud->normal(i);
             if (!std::isfinite(n.x()) || !std::isfinite(n.y()) || !std::isfinite(n.z()))
                 continue;
-            float cos_theta = std::abs(n.z());
+            double cos_theta = std::abs(n.z());
             int idx2d = slope_map->world_to_index(Eigen::Vector2f(pt.x(), pt.y()));
             if (idx2d < 0 || pt.z() < min_z || pt.z() > max_z)
                 continue;
@@ -379,7 +484,7 @@ struct RoseMap::Impl {
                 slope_map->grid[i] = 0.0;
                 continue;
             }
-            float avg_cos = slope_map->grid[i] / count[i];
+            double avg_cos = slope_map->grid[i] / count[i];
             slope_map->grid[i] = 0.0;
             if (avg_cos < bin_params_.cos_thresh) {
                 bin_voxel->set_cell(p, BinMap::Cell { .is_static = false });

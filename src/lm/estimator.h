@@ -110,6 +110,7 @@ public:
     Eigen::Matrix<state::value_type, 3, 1> angular_velocity;
     Eigen::Matrix<state::value_type, 3, 1> linear_acceleration;
     double imu_acceleration_scale;
+    bool is_inited = false;
     void reset();
 
     [[nodiscard]] Eigen::Matrix<state::value_type, state::DIM, state::DIM>

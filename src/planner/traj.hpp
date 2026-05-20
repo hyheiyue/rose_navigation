@@ -24,7 +24,7 @@ public:
         raw_s_ = compute_arc_lengths(raw_path_);
     }
 
-    inline void resample(double sample_ds,double sampled_dt) {
+    inline void resample(double sample_ds, double sampled_dt) {
         if (raw_path_.size() < 2)
             return;
 

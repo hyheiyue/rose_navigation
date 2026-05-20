@@ -29,6 +29,8 @@ find_package(yaml-cpp REQUIRED)
 find_package(TBB REQUIRED)
 find_package(OsqpEigen REQUIRED)
 find_package(osqp REQUIRED)
+# find_package(robin REQUIRED)
+# find_package(kiss_matcher REQUIRED)
 set(OSQP_LIB_PATH /usr/local/lib/libosqp.so)  
 include_directories(/usr/local/include/osqp)  
 message(STATUS "Using manually specified OSQP C library: ${OSQP_LIB_PATH}")
@@ -49,6 +51,8 @@ target_link_libraries(${PROJECT_NAME}
     yaml-cpp
     TBB::tbb
     OsqpEigen::OsqpEigen
+    # robin::robin
+    # kiss_matcher::kiss_matcher_core
     ${OpenCV_LIBS}
     ${OSQP_LIB_PATH}
     

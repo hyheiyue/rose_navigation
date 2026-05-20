@@ -226,6 +226,36 @@ struct SmallPointLIO::Impl {
                 }).detach();
             }
         );
+        reset_trigger_ = node_->create_service<std_srvs::srv::Trigger>(
+            "reset",
+            [this](
+                const std_srvs::srv::Trigger::Request::SharedPtr /**/,
+                std_srvs::srv::Trigger::Response::SharedPtr /**/
+            ) {
+                estimator_->reset();
+                if (pcd_mapping) {
+                    pcd_mapping = std::make_unique<utils::PCDMapping>(0.05);
+                }
+                if (algin_source_grid_) {
+                    algin_source_grid_ =
+                        std::make_unique<utils::PCDMapping>(params_.algin_leaf_size);
+                }
+            }
+        );
+        aligin_trigger_ = node_->create_service<std_srvs::srv::Trigger>(
+            "reset",
+            [this](
+                const std_srvs::srv::Trigger::Request::SharedPtr /**/,
+                std_srvs::srv::Trigger::Response::SharedPtr /**/
+            ) {
+                should_aligin_ = (!should_aligin_);
+                RCLCPP_INFO(
+                    rclcpp::get_logger("rose_nav::lm"),
+                    "algin status: %s",
+                    should_aligin_ ? "enabled" : "disabled"
+                );
+            }
+        );
         if (params_.use_priori_pcd_for_algin) {
             std::vector<Eigen::Vector3f> pointcloud;
             if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
@@ -309,7 +339,6 @@ struct SmallPointLIO::Impl {
     } log_ctx_;
     void handle_once() {
         static double time_current = -1.0;
-        static bool is_inited = false;
         static std::vector<Eigen::Vector3f> pointcloud_odom_frame;
 
         auto start = std::chrono::steady_clock::now();
@@ -328,7 +357,7 @@ struct SmallPointLIO::Impl {
             return !use_dense_points() || !preprocess_.dense_point_deque.empty();
         };
 
-        if (!is_inited) {
+        if (!estimator_->is_inited) {
             int total_points = 0;
             if (params_.batch_update) {
                 for (const auto& b: preprocess_.point_batch_deque) {
@@ -404,7 +433,7 @@ struct SmallPointLIO::Impl {
                 preprocess_.point_deque.clear();
                 preprocess_.imu_deque.clear();
 
-                is_inited = true;
+                estimator_->is_inited = true;
             }
             return;
         }
@@ -993,6 +1022,9 @@ struct SmallPointLIO::Impl {
         last_imu_timestamp = imu_msg.timestamp;
     }
     void algin_callback() {
+        if (!should_aligin_) {
+            return;
+        }
         utils::PCDMapping algin_source_grid;
         {
             std::unique_lock<std::mutex> lock(source_mutex_);
@@ -1036,6 +1068,9 @@ struct SmallPointLIO::Impl {
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_trigger_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trigger_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr aligin_trigger_;
+    bool should_aligin_ = true;
     Eigen::Matrix<state::value_type, state::DIM, state::DIM> Q;
     RclTF::Ptr tf_;
     std::thread output_thread_;

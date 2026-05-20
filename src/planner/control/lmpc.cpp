@@ -15,6 +15,7 @@ struct LMPC::Impl {
         int max_iter = 100;
         int predict_steps = 30;
         double max_speed = 2.0;
+        double turtle_max_speed = 1.0;
         double max_accel = 1.0;
         double delay_time = 0.0;
         double blind_radius;
@@ -26,6 +27,7 @@ struct LMPC::Impl {
             max_iter = config.declare<int>("max_iter");
             predict_steps = config.declare<int>("predict_steps");
             max_speed = config.declare<double>("max_speed");
+            turtle_max_speed = config.declare<double>("turtle_max_speed");
             max_accel = config.declare<double>("max_accel");
             delay_time = config.declare<double>("delay_time");
             blind_radius = config.declare<double>("blind_radius");
@@ -54,6 +56,9 @@ struct LMPC::Impl {
     }
     double get_esdf(const Eigen::Vector2d& pos) {
         return rose_map_->esdf()->get_esdf(pos.cast<float>());
+    }
+    void set_need_turtle(bool need) {
+        need_turtle_ = need;
     }
     bool get_re(const int T_in, double dt_in) {
         P_.clear();
@@ -254,7 +259,7 @@ struct LMPC::Impl {
 
         /* velocity bounds */
 
-        const double max_speed = params_.max_speed;
+        const double max_speed = need_turtle_ ? params_.turtle_max_speed : params_.max_speed;
 
         int offset = dyn_rows;
 
@@ -457,6 +462,7 @@ struct LMPC::Impl {
     Ctx omni_;
     map::RoseMap::Ptr rose_map_;
     MotionModel motion_model_ = MotionModel::OMNI;
+    bool need_turtle_ = false;
 };
 LMPC::LMPC(map::RoseMap::Ptr rose_map, const ParamsNode& config) {
     _impl = std::make_unique<Impl>(rose_map, config);
@@ -472,5 +478,8 @@ void LMPC::set_traj(const Traj& traj) {
 }
 void LMPC::set_current(const RoboState& c) {
     _impl->set_current(c);
+}
+void LMPC::set_need_turtle(bool a) {
+    _impl->set_need_turtle(a);
 }
 } // namespace rose_nav::planner

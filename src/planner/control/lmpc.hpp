@@ -15,6 +15,7 @@ public:
     std::optional<ControlOutput> solve(std::chrono::duration<double> dt);
     void set_traj(const Traj& traj);
     void set_current(const RoboState& c);
+    void set_need_turtle(bool need);
     ~LMPC();
     struct Impl;
     std::unique_ptr<Impl> _impl;

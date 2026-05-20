@@ -10,6 +10,7 @@
 #include <rclcpp/node.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 namespace rose_nav::planner {
 using TrajType = Trajectory<5, 2>;
 struct RoboState {
@@ -174,6 +175,47 @@ struct ControlOutput {
         marker.color.a = 1.0f;
 
         marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+    }
+};
+struct Tunnel {
+    Eigen::Vector2d p;
+    double r = 0.5;
+    bool is_in_tunnel(const Eigen::Vector2d& pos) const noexcept {
+        return (pos - p).norm() < r;
+    }
+    void fill_marker(visualization_msgs::msg::MarkerArray& markerarr, int id = 0) const noexcept {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "map";
+        marker.header.stamp = rclcpp::Clock().now();
+        marker.ns = "tunnel";
+        marker.id = id;
+        marker.type = visualization_msgs::msg::Marker::CYLINDER; // 圆柱表示圆
+        marker.action = visualization_msgs::msg::Marker::ADD;
+
+        // 位置
+        marker.pose.position.x = p.x();
+        marker.pose.position.y = p.y();
+        marker.pose.position.z = 0.0; // 如果只在平面
+        marker.pose.orientation.x = 0.0;
+        marker.pose.orientation.y = 0.0;
+        marker.pose.orientation.z = 0.0;
+        marker.pose.orientation.w = 1.0;
+
+        // 尺寸
+        marker.scale.x = r * 2.0; // 半径转换为直径
+        marker.scale.y = r * 2.0;
+        marker.scale.z = 0.1; // 高度很小即可表示平面圆
+
+        // 颜色
+        marker.color.r = 1.0;
+        marker.color.g = 0.0;
+        marker.color.b = 0.0;
+        marker.color.a = 0.8;
+
+        marker.lifetime = rclcpp::Duration(0, 0); // 永久显示
+
+        // 添加到 MarkerArray
+        markerarr.markers.push_back(marker);
     }
 };
 } // namespace rose_nav::planner

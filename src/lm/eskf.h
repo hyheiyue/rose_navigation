@@ -54,6 +54,18 @@ struct state {
         bg += vec.segment<3>(bg_index);
         ba += vec.segment<3>(ba_index);
     }
+    inline void reset() {
+        position = Eigen::Matrix<value_type, 3, 1>::Zero(); // 位置
+        rotation = Eigen::Matrix<value_type, 3, 3>::Identity(); // 旋转
+        offset_R_L_I = Eigen::Matrix<value_type, 3, 3>::Identity(); // 雷达到 IMU 的 R
+        offset_T_L_I = Eigen::Matrix<value_type, 3, 1>::Zero(); // 雷达到 IMU 的 T
+        velocity = Eigen::Matrix<value_type, 3, 1>::Zero(); // 速度
+        omg = Eigen::Matrix<value_type, 3, 1>::Zero(); // 角速度
+        acceleration = Eigen::Matrix<value_type, 3, 1>::Zero(); // 加速度
+        gravity = Eigen::Matrix<value_type, 3, 1>::Zero(); // 重力
+        bg = Eigen::Matrix<value_type, 3, 1>::Zero(); // 陀螺仪零偏
+        ba = Eigen::Matrix<value_type, 3, 1>::Zero(); // 加速度零偏
+    }
 };
 
 struct point_measurement_result { // NOLINT(cppcoreguidelines-pro-type-member-init)
