@@ -274,15 +274,15 @@ struct RosePlanner::Impl {
         now_state_marker.pose.position.z = 0.0;
         now_state_marker_pub_->publish(now_state_marker);
         if (!has_traj_) {
-            if ((fsm_ == FSMSTATE::SEARCH_PATH || fsm_ == FSMSTATE::REPLAN)
-                && params_.use_control_output) {
-                geometry_msgs::msg::Twist cmd;
-                cmd.linear.x = 0.0;
-                cmd.linear.y = 0.0;
-                cmd.linear.z = need_turtle_ ? 100 : -100;
-                cmd.angular.z = params_.default_wz;
-                cmd_vel_pub_->publish(cmd);
-            }
+            // if ((fsm_ == FSMSTATE::SEARCH_PATH || fsm_ == FSMSTATE::REPLAN)
+            //     && params_.use_control_output) {
+            //     geometry_msgs::msg::Twist cmd;
+            //     cmd.linear.x = 0.0;
+            //     cmd.linear.y = 0.0;
+            //     cmd.linear.z = need_turtle_ ? 100 : -100;
+            //     cmd.angular.z = params_.default_wz;
+            //     cmd_vel_pub_->publish(cmd);
+            // }
             return;
         }
         static auto last_fsm = FSMSTATE::INIT;
