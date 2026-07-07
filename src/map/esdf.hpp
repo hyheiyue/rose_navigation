@@ -20,6 +20,7 @@ public:
         if (bin_map_->has_static_) {
             return;
         }
+        // 动态局部地图模式下，ESDF 跟随机器人附近区域滑动；静态地图模式下范围固定。
         VoxelKey<2> new_center = esdf_->world_to_key(o);
         VoxelKey<2> shift { new_center.x() - esdf_->center_key.x(),
                             new_center.y() - esdf_->center_key.y() };
@@ -35,6 +36,7 @@ public:
         if (idx >= 0) {
             return esdf_->grid[idx];
         }
+        // 地图外默认返回极大安全距离，避免规划器把未知边界误判成障碍。
         return kInf;
     }
     float get_esdf(int i) {
@@ -73,9 +75,11 @@ public:
     std::vector<float> dist_to_occ_;
     std::vector<float> dist_to_free_;
     BinMap::Ptr bin_map_;
+    // 8 邻域传播方向：前四个是直连邻居，后四个是对角邻居。
     static constexpr int dx8_[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
     static constexpr int dy8_[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
+    // step_cost_[0] 为横纵移动代价，step_cost_[1] 为对角移动代价。
     float step_cost_[2];
 
     inline bool is_diagonal_idx(int k) const {

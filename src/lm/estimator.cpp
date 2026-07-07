@@ -42,6 +42,7 @@ void Estimator::reset() {
                 pointcloud.begin(),
                 pointcloud.end(),
                 [&](const auto& a, const auto& b) {
+                    // 先插入离初始位姿更远的点，减少局部区域过密时对 iVox 桶的早期占用。
                     return (a - params_.init_pose_in_prior_pcd.translation().cast<float>())
                                .squaredNorm()
                         > (b - params_.init_pose_in_prior_pcd.translation().cast<float>())
@@ -67,6 +68,7 @@ void Estimator::reset() {
         }
     }
     kf.x.reset();
+    // 初始协方差保守设置：姿态/位置较小，IMU bias 与重力方向允许后续量测继续修正。
     kf.P = Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Identity() * 0.01;
     kf.P.block<3, 3>(state::gravity_index, state::gravity_index).diagonal().fill(0.0001);
     kf.P.block<3, 3>(state::bg_index, state::bg_index).diagonal().fill(0.001);
@@ -78,6 +80,7 @@ void Estimator::reset() {
 Estimator::process_noise_cov() const {
     Eigen::Matrix<state::value_type, state::DIM, state::DIM> cov =
         Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Zero();
+    // 过程噪声按状态块配置，便于独立调节速度、角速度、加速度和 IMU bias 的可信度。
     cov.block<3, 3>(state::velocity_index, state::velocity_index)
         .diagonal()
         .fill(static_cast<state::value_type>(params_.velocity_cov));
@@ -137,6 +140,7 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
                 R_delta = exp<double>(w * dt);
             }
 
+            // 先将每个点去畸变到当前批次时间，再搜索局部地图平面。
             const Eigen::Vector3d pt_odom_d = (kf_rot * R_delta) * pt_imu_d + kf_pos + kf_vel * dt;
 
             points_odom_frame[i] = pt_odom_d.cast<float>();
@@ -165,6 +169,7 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
             }
             cov /= static_cast<double>(near.size() - 1);
 
+            // 邻域协方差矩阵的最小特征向量即拟合平面的法向量。
             solver.compute(cov);
             const Eigen::Vector3d n = solver.eigenvectors().col(0);
             const double d_plane = -n.dot(centroid);
@@ -174,6 +179,8 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
             if (s.batch_iter == 0) {
                 const double pt_norm = current_batch.points[i].position.norm();
 
+                // 首轮迭代先过滤弱匹配；后续迭代基于更精确的状态，
+                // 可以更直接地使用残差。
                 if (pt_norm <= match_s * d_signed * d_signed) {
                     continue;
                 }
@@ -192,6 +199,7 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
 
             point_measurement_result mr {};
             mr.valid = true;
+            // 量测残差采用点到平面的有符号距离，z 取负值以匹配滤波器更新方向。
             mr.z = -d_signed;
             mr.laser_point_cov = laser_cov;
             mr.count = current_batch.points[i].count;
@@ -199,6 +207,8 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
             const Eigen::Matrix<state::value_type, 3, 1> normal0 = n.cast<state::value_type>();
 
             if (ext_on) {
+                // 开启外参估计时，在点到平面 Jacobian 的位姿项后追加
+                // LiDAR-IMU 旋转和平移外参的导数。
                 const Eigen::Matrix<state::value_type, 3, 1> C = s.rotation.transpose() * normal0;
 
                 const Eigen::Matrix<state::value_type, 3, 1> A =
@@ -224,7 +234,7 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
 
 void Estimator::h_point(const state& s, point_measurement_result& measurement_result) {
     measurement_result.valid = false;
-    // get closest point
+    // 将当前 LiDAR 点转换到 IMU 再到里程计坐标系，用于在局部 iVox 地图中找邻域点。
     Eigen::Matrix<state::value_type, 3, 1> point_imu_frame;
     if (params_.extrinsic_est_en) {
         point_imu_frame =
@@ -238,7 +248,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
     if (nearest_points.size() < MIN_MATCH_POINTS) {
         return;
     }
-    // estimate plane
+    // 对近邻点做 PCA 平面拟合，后续使用点到平面的距离作为滤波器量测。
 
     Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
     for (const auto& p: nearest_points) {
@@ -257,6 +267,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
     for (size_t j = 0; j < nearest_points.size(); j++) {
         float point_distanace = std::abs(normal.dot(nearest_points[j]) + d);
         if (point_distanace > params_.plane_threshold) {
+            // 邻域点自身都不能很好落在同一平面时，说明该匹配不稳定，直接丢弃。
             return;
         }
     }
@@ -264,7 +275,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
     if (point_lidar_frame.norm() <= params_.match_sqaured * point_distanace * point_distanace) {
         return;
     }
-    // calculate residual and jacobian matrix
+    // 计算点到平面残差及其对状态量的 Jacobian。
     measurement_result.laser_point_cov = static_cast<state::value_type>(params_.laser_point_cov);
     if (params_.extrinsic_est_en) {
         Eigen::Matrix<state::value_type, 3, 1> normal0 = normal.cast<state::value_type>();
@@ -286,6 +297,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
 
 void Estimator::h_imu(const state& s, imu_measurement_result& measurement_result) {
     std::memset(measurement_result.satu_check, false, 6);
+    // IMU 量测模型约束角速度和线加速度，bias 作为状态量在滤波过程中估计。
     measurement_result.z.segment<3>(0) = angular_velocity - s.omg - s.bg;
     measurement_result.z.segment<3>(3) =
         linear_acceleration * imu_acceleration_scale - s.acceleration - s.ba;
@@ -294,10 +306,12 @@ void Estimator::h_imu(const state& s, imu_measurement_result& measurement_result
     if (params_.check_satu) {
         for (int i = 0; i < 3; i++) {
             if (std::abs(angular_velocity(i)) >= params_.satu_gyro) {
+                // 饱和轴的量测不可信，将残差置零，并通过 satu_check 告诉滤波器跳过该维。
                 measurement_result.satu_check[i] = true;
                 measurement_result.z(i) = 0.0;
             }
             if (std::abs(linear_acceleration(i)) >= params_.satu_acc) {
+                // 加速度饱和同样不参与更新，避免剧烈碰撞或异常数据污染状态。
                 measurement_result.satu_check[i + 3] = true;
                 measurement_result.z(i + 3) = 0.0;
             }

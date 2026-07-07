@@ -78,6 +78,8 @@ struct RosePlanner::Impl {
             [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
                 const auto& odom_in = *msg;
 
+                // 将里程计统一到规划坐标系，保证搜索、ESDF 安全检查和 MPC
+                // 都在同一个 2D 地图坐标系下工作。
                 static Eigen::Isometry3d T;
                 if (auto opt = tf_->get_transform<double>(
                         params_.target_frame,
@@ -144,6 +146,8 @@ struct RosePlanner::Impl {
             goal_topic,
             10,
             [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+                // 目标点可能来自 RViz 或决策节点，坐标系不一定相同；缓存上一次
+                // 有效 TF，容忍短时间 TF 查询失败。
                 static Eigen::Isometry3d target_2_msg = Eigen::Isometry3d::Identity();
                 auto target_2_msg_opt = tf_->get_transform<double>(
                     params_.target_frame,
@@ -243,6 +247,7 @@ struct RosePlanner::Impl {
         RCLCPP_INFO(rclcpp::get_logger("rose_nav:planner"), "set goal : %.2f , %.2f", p.x(), p.y());
         switch (goal_mode_) {
             case GoalMode::SINGALE: {
+                // 单目标模式下，新目标会立即覆盖当前队列，并触发重新搜索。
                 goal_buf_.pos.push_back(p);
                 goal_ = goal_buf_;
                 fsm_ = FSMSTATE::SEARCH_PATH;
@@ -251,6 +256,7 @@ struct RosePlanner::Impl {
             }
 
             case GoalMode::MULTI: {
+                // 多目标模式下，先缓存目标点，后续可扩展为批量提交路径点。
                 goal_buf_.pos.push_back(p);
                 break;
             }
@@ -290,6 +296,8 @@ struct RosePlanner::Impl {
             static rclcpp::Time replan_start_time;
             static bool timer_active = false;
 
+            // 离开 REPLAN 后先短暂保持旋转指令，而不是立刻恢复 MPC 输出，
+            // 给规划线程留出发布新轨迹的时间。
             auto now = node_->get_clock()->now();
             if (last_fsm == FSMSTATE::REPLAN) {
                 replan_start_time = now;
@@ -321,6 +329,8 @@ struct RosePlanner::Impl {
         if (output_opt) {
             auto output = output_opt.value();
             if (params_.use_control_output) {
+                // MPC 在地图坐标系下优化；底盘控制通常使用机体系平面速度，
+                // 因此需要根据当前 yaw 将速度旋转到机体系。
                 double yaw = now_state.yaw;
                 double vx_world = output.vel.x();
                 double vy_world = output.vel.y();
@@ -355,6 +365,7 @@ struct RosePlanner::Impl {
         auto current = robo_->get_now_state();
         OldPos o { .pos = current.pos, .time = node_->now() };
         old_positions_.push_back(o);
+        // 保存短时间历史轨迹，用于判断机器人尾部是否仍在隧道等受限区域内。
         while (old_positions_.size() > 2
                && (old_positions_.back().time - old_positions_.front().time)
                    > rclcpp::Duration::from_seconds(params_.check_turtle_back))
@@ -393,6 +404,8 @@ struct RosePlanner::Impl {
             const auto& old_raw = current_traj_.raw_path_;
             cut_raw_idx = std::clamp(cut_raw_idx, 0, static_cast<int>(old_raw.size()) - 2);
 
+            // 复用上一条路径仍然安全的尾段，只重新搜索前缀路径，
+            // 让重规划保持局部性，并减少靠近目标时的路径跳变。
             std::vector<Eigen::Vector2d> front_path =
                 search_once(current_pos, old_raw[cut_raw_idx]);
 
@@ -416,6 +429,8 @@ struct RosePlanner::Impl {
 
             std::vector<Piece<5, 2>> pieces;
 
+            // no_opt_range 用于在局部修复时保护近端轨迹，
+            // 避免控制器追踪一条在机器人脚下突然改变的轨迹。
             pieces = traj_opt_->optimize(
                 current_traj_.sampled_,
                 current_traj_.sampled_dt_,
@@ -448,6 +463,7 @@ struct RosePlanner::Impl {
                 auto current = robo_->get_now_state();
                 has_traj_ = false;
 
+                // SEARCH_PATH 只做全局/较大范围路径搜索，成功后再进入 REPLAN 持续监控安全性。
                 auto raw_path = search_once(current.pos, goal_.pos.front());
                 if (rebuild_traj(raw_path, current)) {
                     last_how_to_replan = -1;
@@ -476,6 +492,7 @@ struct RosePlanner::Impl {
                 double now_t_in_traj = t_and_dis.first;
 
                 if (t_and_dis.second > 0.5) {
+                    // 当前机器人偏离轨迹太远时，局部修补意义不大，回到 SEARCH_PATH 重新规划。
                     RCLCPP_WARN(logger, "now in traj too far %.2f", t_and_dis.second);
                     fsm_ = FSMSTATE::SEARCH_PATH;
                     break;
@@ -494,6 +511,8 @@ struct RosePlanner::Impl {
                 int last_unsafe_raw_idx = -1;
                 double last_unsafe_traj_time = -1.0;
 
+                // 同时检查离散 raw path 和连续优化轨迹：raw path 用于发现通道被阻塞，
+                // 连续轨迹用于发现优化器带来的越界或贴障问题。
                 for (double t = now_t_in_traj; t <= check_end_time; t += sample_dt) {
                     int traj_idx = current_traj_.locate_traj_piece_idx_by_time(t).first;
                     int raw_idx = current_traj_.get_raw_idx_by_traj_pieces_idx(traj_idx);
@@ -509,6 +528,8 @@ struct RosePlanner::Impl {
                 need_turtle_ = false;
                 double check_turtle_end_time =
                     std::min(now_t_in_traj + params_.check_turtle_front, total_duration);
+                // 隧道模式会保留一小段历史状态，确保底盘在完全离开受限区域前
+                // 持续保持特殊姿态。
                 for (double t = now_t_in_traj; t <= check_turtle_end_time; t += sample_dt) {
                     if (is_in_tunnel(current_traj_.get_traj_pos_by_time(t))) {
                         need_turtle_ = true;
@@ -525,6 +546,7 @@ struct RosePlanner::Impl {
                 mpc_->set_need_turtle(need_turtle_);
 
                 if (last_unsafe_raw_idx != -1) {
+                    // raw path 上已经出现不安全路段时，说明拓扑路径需要局部换路。
                     RCLCPP_INFO(
                         logger,
                         "raw path unsafe last_unsafe_raw_idx: %d",
@@ -538,6 +560,7 @@ struct RosePlanner::Impl {
                     for (int i = 0; i < static_cast<int>(current_traj_.sampled_.size()); ++i) {
                         if (current_traj_.sampled_[i].s / params_.expected_speed
                             > params_.check_safe_horizon) {
+                            // 保护当前安全检查窗口内的采样点，优先保证控制连续性。
                             no_opt_end = i;
                             break;
                         }
@@ -556,6 +579,7 @@ struct RosePlanner::Impl {
                     break;
                 } else if (last_unsafe_traj_time >= 0.01) {
                     last_how_to_replan = repaln_by_traj;
+                    // raw path 仍安全但连续轨迹不安全时，只重跑轨迹优化，避免不必要的 A* 搜索。
                     RCLCPP_INFO(
                         logger,
                         "traj unsafe last_unsafe_traj_time: %f",
@@ -625,6 +649,7 @@ struct RosePlanner::Impl {
         if (idx < 0)
             return true;
 
+        // ESDF 小于机器人半径表示圆形 footprint 与障碍物发生碰撞或距离不足。
         if (esdf->get_esdf(idx) < params_.robot_radius) {
             return false;
         }

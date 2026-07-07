@@ -20,6 +20,7 @@ public:
     }
     template<typename UpdateFunc>
     void update(const UpdateFunc& update_func) {
+        // 由 RoseMap 注入更新逻辑，使 BinMap 既可以接收动态障碍，也可以保留静态地图。
         update_func(this);
     }
     std::vector<Eigen::Vector4f> get_occupied_points() const {
@@ -102,6 +103,7 @@ public:
                 if (occ < occ_th)
                     continue;
 
+                // ROS map 图片坐标原点在左上角，地图坐标原点在左下角，因此 y 方向需要翻转。
                 float wx = origin.x() + (x + 0.5f) * resolution;
                 float wy = origin.y() + (height - 1 - y + 0.5f) * resolution;
 

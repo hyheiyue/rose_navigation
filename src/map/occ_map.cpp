@@ -77,6 +77,8 @@ struct OccMap::Impl {
             auto sensor_center = frame.sensor_origin;
             auto& pts = frame.pts;
 
+            // 接收线程只负责点云体素化和重复命中聚合，log-odds 更新与射线清空
+            // 交给工作线程处理，避免传感器回调过重。
             Ray ray;
             if (ray_buf) {
                 ray_buf->indices.reserve(pts.size());
@@ -126,6 +128,7 @@ struct OccMap::Impl {
                 auto cell = get_cell(idx);
                 auto& c = cell.get();
 
+                // 同一帧内命中同一体素会累计 count，命中越多，占据概率提升越快。
                 c.log_odds = std::max(c.log_odds + params_.log_hit * hit.count[i], params_.log_min);
                 c.last_update = hit.ctx;
                 track_state(idx);
@@ -147,6 +150,7 @@ struct OccMap::Impl {
                 auto cell = get_cell(idx);
                 auto& c = cell.get();
 
+                // 射线穿过的体素被认为是空闲区域，log_free 通常为负值，用于降低占据置信度。
                 c.log_odds =
                     std::min(c.log_odds + params_.log_free * free.count[i], params_.log_max);
                 c.last_update = free.ctx;
@@ -175,6 +179,8 @@ struct OccMap::Impl {
             const auto o = ray.inmap.ctx.sensor_key;
             const Eigen::Vector3f o_center(o.x() + 0.5f, o.y() + 0.5f, o.z() + 0.5f);
 
+            // DDA 遍历时每个线程先在本地缓存 free cell，单帧结束后再合并，
+            // 避免每条射线访问体素时频繁加锁。
             tbb::enumerable_thread_specific<RayResult> tls([&] {
                 RayResult v;
                 v.reserve(256);
@@ -201,6 +207,7 @@ struct OccMap::Impl {
                     const int idx = ray.inmap.indices[i];
                     const auto k = index_to_key(idx);
 
+                    // 对地图内命中点，射线从传感器原点走到命中体素前停止，不清空终点本身。
                     Eigen::Vector3f d(k.x() + 0.5f, k.y() + 0.5f, k.z() + 0.5f);
                     d -= o_center;
 
@@ -233,6 +240,7 @@ struct OccMap::Impl {
 
                     const auto& h = ray.outmap[i];
 
+                    // 地图外命中点没有终点体素可保留，只沿方向清空到最大射程。
                     Eigen::Vector3f d(h.x() + 0.5f, h.y() + 0.5f, h.z() + 0.5f);
                     d -= o_center;
 
@@ -262,6 +270,7 @@ struct OccMap::Impl {
             return params_.unknown_is_occupied;
         const Cell& c = voxel_map_->grid[idx];
 
+        // 除占据概率外，还要求更新时间没有超时，避免动态障碍长期残留。
         return c.log_odds > params_.occ_th && std::abs(c.last_update - now_) < params_.timeout;
     }
 
@@ -272,6 +281,7 @@ struct OccMap::Impl {
 
         auto occ_buf_copy = get_occupied_idx();
         for (const auto& idx: occ_buf_copy) {
+            // 更新时间推进后，原先占据的体素可能因 timeout 变为空闲，需要重新维护索引表。
             track_state(idx);
         }
     }
@@ -303,6 +313,7 @@ struct OccMap::Impl {
             && std::abs(shift.z()) < min_shift)
             return;
 
+        // 滑动窗口移动后，新进入窗口的体素必须重置，避免复用旧区域的概率状态。
         voxel_map_->slide_to(new_center, [&](int idx) { reset_a_cell(idx); });
     }
     class CellGuard {
@@ -361,6 +372,8 @@ struct OccMap::Impl {
         const Policy& policy,
         RayResult& out
     ) noexcept {
+        // 3D DDA 按参数距离顺序穿过体素边界。Policy 决定终点是否截断射线，
+        // 以及如何记录经过的体素。
         using Vec3 = Eigen::Array3f;
         constexpr float eps = 1e-6f;
         const float inf = std::numeric_limits<float>::infinity();
@@ -443,6 +456,7 @@ struct OccMap::Impl {
         IdxBuf(size_t n) {
             resize(n);
         }
+        // 使用单帧 stamp 记录是否已访问，既能统计重复命中，又避免整表清零。
         inline void try_push(int idx, uint32_t now) {
             if (stamp[idx] != now) {
                 stamp[idx] = now;
@@ -483,6 +497,7 @@ struct OccMap::Impl {
         bool was_occ = (p != -1);
         bool now_occ = is_occupied(idx);
 
+        // 维护可 O(1) 删除的占据体素稠密列表，供可视化和 ESDF 重建使用。
         if (was_occ && !now_occ) {
             std::lock_guard<std::mutex> lock(occupied_mutex_);
             int last = occupied_buffer_idx_.back();

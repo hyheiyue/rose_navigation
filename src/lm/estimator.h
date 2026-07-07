@@ -97,7 +97,7 @@ public:
     Estimator(const ParamsNode& config);
 
     eskf kf;
-    // for h_point
+    // h_point / h_batch 使用的局部地图与点到平面匹配缓存。
     std::shared_ptr<SmallIVox> ivox;
     Eigen::Matrix<state::value_type, 3, 1> Lidar_T_wrt_IMU;
     Eigen::Matrix<state::value_type, 3, 3> Lidar_R_wrt_IMU;
@@ -106,7 +106,7 @@ public:
     std::vector<Eigen::Vector3f> nearest_points;
     common::Batch current_batch;
     std::vector<Eigen::Vector3f> points_odom_frame;
-    // for h_imu
+    // h_imu 使用的当前 IMU 量测缓存，进入滤波器前会做尺度和饱和检查。
     Eigen::Matrix<state::value_type, 3, 1> angular_velocity;
     Eigen::Matrix<state::value_type, 3, 1> linear_acceleration;
     double imu_acceleration_scale;

@@ -32,8 +32,8 @@ ESDF::ESDF(BinMap::Ptr bin, const ParamsNode& config) {
     dist_to_free_.resize(N);
 
     const float vs = bin->voxel_map_->voxel_size;
-    step_cost_[0] = vs; // straight
-    step_cost_[1] = vs * std::sqrt(2.0f); // diagonal
+    step_cost_[0] = vs; // 横纵相邻代价
+    step_cost_[1] = vs * std::sqrt(2.0f); // 对角相邻代价
 }
 void ESDF::update() {
     rebuild_signed();
@@ -71,6 +71,8 @@ void ESDF::propagate_key_distance_field_two_pass(
         return;
     }
 
+    // 通过前后两次栅格扫描近似 8 邻域距离变换，比从每个源点做图搜索更轻量，
+    // 对局部规划的安全距离判断已经足够。
     const int Kmax = 8;
 
     const int min_x = esdf_->min_key.x();
@@ -95,11 +97,11 @@ void ESDF::propagate_key_distance_field_two_pass(
             return;
 
         for (int k = 0; k < Kmax; ++k) {
-            // forward: 只用左/上
+            // forward 扫描时只使用已经遍历过的左/上方向邻居。
             if (forward && (dx8_[k] > 0 || dy8_[k] > 0))
                 continue;
 
-            // backward: 只用右/下
+            // backward 扫描时只使用已经遍历过的右/下方向邻居。
             if (!forward && (dx8_[k] < 0 || dy8_[k] < 0))
                 continue;
 
@@ -115,6 +117,7 @@ void ESDF::propagate_key_distance_field_two_pass(
             if (!std::isfinite(nd))
                 continue;
 
+            // 当前格子的距离由邻居距离加一步移动代价松弛得到。
             float step = step_cost_[is_diagonal_idx(k) ? 1 : 0];
             best = std::min(best, nd + step);
         }
@@ -131,6 +134,8 @@ void ESDF::propagate_key_distance_field_two_pass(
             relax(x, y, false);
 }
 void ESDF::rebuild_signed() {
+    // 先把当前二值地图展开成占据快照，再基于同一份快照重建两个距离场，
+    // 避免滑动地图更新过程中混入不一致状态。
     std::vector<uint8_t> acc(esdf_->grid_size(), false);
     for (const auto& [key, cell]: bin_map_->voxel_map_->grid) {
         auto p = bin_map_->voxel_map_->key_to_world(key);
@@ -148,6 +153,7 @@ void ESDF::rebuild_signed() {
         tbb::blocked_range<int>(0, esdf_->grid_size()),
         [&](const tbb::blocked_range<int>& r) {
             for (int i = r.begin(); i != r.end(); ++i) {
+                // 正值表示在障碍物外部，负值表示在占据空间内部。
                 esdf_->grid[i] = dist_to_occ_[i] - dist_to_free_[i];
             }
         }

@@ -66,6 +66,7 @@ struct LMPC::Impl {
 
         auto t_cur_and_dis = traj_.get_traj_time_by_pos(now_state_w_.pos);
         if (t_cur_and_dis.second > 0.5) {
+            // 当前状态离参考轨迹过远时，MPC 的线性参考已不可靠，交给上层重新规划。
             return false;
         }
         double t_cur = t_cur_and_dis.first;
@@ -89,6 +90,7 @@ struct LMPC::Impl {
                 auto vec = curr_pos - now_pos;
                 auto curr_vel = traj_.get_traj_vel_by_time(t);
                 if (vec.norm() < params_.blind_radius) {
+                    // 跳过离当前点过近的参考点，避免预测时域内全是几乎重合的点。
                     t += dt_in;
                     i--;
                     continue;
@@ -99,6 +101,7 @@ struct LMPC::Impl {
                 tp.vel = curr_vel;
                 tp.acc = traj_.get_traj_acc_by_time(t);
                 double yaw = traj_.get_traj_yaw_by_time(t);
+                // yaw 需要展开到连续角度，避免跨 pi/-pi 时参考角速度突变。
                 yaw = yaw_end + angles::shortest_angular_distance(yaw_end, yaw);
                 tp.yaw = yaw;
                 tp.w = traj_.get_traj_yaw_dot_by_time(t);
@@ -109,6 +112,7 @@ struct LMPC::Impl {
                 w_end = tp.w;
 
             } else {
+                // 超出轨迹末端后保持最后一个参考点，让控制器自然减速并稳定在终点附近。
                 tp.pos = pos_end;
                 tp.vel = Eigen::Vector2d::Zero();
                 tp.acc = Eigen::Vector2d::Zero();
@@ -133,6 +137,7 @@ struct LMPC::Impl {
         RoboState temp = now_state_w_;
 
         for (int i = 1; i <= params_.predict_steps; ++i) {
+            // 使用上一轮求解出的控制序列滚动预测，作为本轮 MPC 的初始状态轨迹。
             state_trans_omni(temp, omni_.output(0, i - 1), omni_.output(1, i - 1));
 
             xbar_[i] = temp;
@@ -147,8 +152,8 @@ struct LMPC::Impl {
             return;
         }
 
-        const int dimx = 2 * steps; // x y
-        const int dimu = 2 * steps; // vx vy
+        const int dimx = 2 * steps; // 状态变量：每个预测步的 x、y
+        const int dimu = 2 * steps; // 控制变量：每个预测步的 vx、vy
         const int nx = dimx + dimu;
 
         omni_.qp_gradient.setZero(nx);
@@ -157,7 +162,7 @@ struct LMPC::Impl {
         const auto R = params_.R_omni;
         const auto Rd = params_.Rd_omni;
 
-        /* ---------------- cost gradient ---------------- */
+        /* ---------------- 目标函数一阶项 ---------------- */
 
         for (int i = 0; i < steps; ++i) {
             int xi = 2 * i;
@@ -173,12 +178,12 @@ struct LMPC::Impl {
             omni_.qp_gradient[ui + 1] = -2.0 * R[1] * omni_.dref(1, i);
         }
 
-        /* ---------------- Hessian ---------------- */
+        /* ---------------- 目标函数二阶项 Hessian ---------------- */
 
         std::vector<Eigen::Triplet<double>> H_trip;
         H_trip.reserve(nx * 4);
 
-        /* state cost */
+        /* 状态跟踪代价 */
 
         for (int i = 0; i < steps; ++i) {
             int xi = 2 * i;
@@ -189,7 +194,7 @@ struct LMPC::Impl {
             }
         }
 
-        /* control cost */
+        /* 控制输入代价 */
 
         for (int i = 0; i < steps; ++i) {
             int ui = dimx + 2 * i;
@@ -209,7 +214,7 @@ struct LMPC::Impl {
             H_trip.emplace_back(ui + 1, ui + 1, 2.0 * w1);
         }
 
-        /* velocity smooth */
+        /* 速度平滑代价：惩罚相邻控制量差分 */
 
         for (int i = 1; i < steps; ++i) {
             int ui = dimx + 2 * i;
@@ -226,7 +231,7 @@ struct LMPC::Impl {
         omni_.qp_hessian.setFromTriplets(H_trip.begin(), H_trip.end());
         omni_.qp_hessian.makeCompressed();
 
-        /* ---------------- constraints ---------------- */
+        /* ---------------- 约束上下界 ---------------- */
 
         const int dyn_rows = 2 * steps;
         const int speed_rows = 2 * steps;
@@ -237,7 +242,7 @@ struct LMPC::Impl {
         omni_.qp_lowerBound.setConstant(nc, -1e10);
         omni_.qp_upperBound.setConstant(nc, 1e10);
 
-        /* initial state */
+        /* 初始状态约束 */
 
         Eigen::Vector2d x0;
         x0 << now_state_w_.pos.x(), now_state_w_.pos.y();
@@ -245,7 +250,7 @@ struct LMPC::Impl {
         omni_.qp_lowerBound.segment(0, 2) = x0;
         omni_.qp_upperBound.segment(0, 2) = x0;
 
-        /* dynamics rows */
+        /* 离散动力学约束：x_i - x_{i-1} - v_{i-1} * dt = 0 */
 
         for (int i = 1; i < steps; ++i) {
             int r = 2 * i;
@@ -257,7 +262,7 @@ struct LMPC::Impl {
             omni_.qp_upperBound[r + 1] = 0.0;
         }
 
-        /* velocity bounds */
+        /* 速度上下界；隧道模式下使用更低的 turtle_max_speed */
 
         const double max_speed = need_turtle_ ? params_.turtle_max_speed : params_.max_speed;
 
@@ -273,7 +278,7 @@ struct LMPC::Impl {
             omni_.qp_upperBound[r + 1] = max_speed;
         }
 
-        /* velocity change */
+        /* 速度变化约束，用最大加速度限制相邻控制量差值 */
 
         offset += speed_rows;
 
@@ -289,18 +294,18 @@ struct LMPC::Impl {
             omni_.qp_upperBound[r + 1] = max_dv;
         }
 
-        /* ---------------- A matrix ---------------- */
+        /* ---------------- 约束矩阵 A ---------------- */
 
         if (!omni_.solver_initialized) {
             Eigen::SparseMatrix<double> A(nc, nx);
             std::vector<Eigen::Triplet<double>> A_trip;
 
-            /* initial state */
+            /* 初始状态 */
 
             A_trip.emplace_back(0, 0, 1.0);
             A_trip.emplace_back(1, 1, 1.0);
 
-            /* dynamics */
+            /* 动力学等式 */
 
             for (int i = 1; i < steps; ++i) {
                 int r = 2 * i;
@@ -317,7 +322,7 @@ struct LMPC::Impl {
                 A_trip.emplace_back(r + 1, ucol + 1, -dt);
             }
 
-            /* velocity constraint */
+            /* 速度边界约束 */
 
             int offsetA = dyn_rows;
 
@@ -329,7 +334,7 @@ struct LMPC::Impl {
                 A_trip.emplace_back(r + 1, c + 1, 1.0);
             }
 
-            /* velocity smooth */
+            /* 速度变化约束 */
 
             offsetA += speed_rows;
 
@@ -379,6 +384,7 @@ struct LMPC::Impl {
         omni_.solver.updateGradient(omni_.qp_gradient);
         omni_.solver.updateBounds(omni_.qp_lowerBound, omni_.qp_upperBound);
 
+        // A 的稀疏结构在预测步数不变时固定，只更新 Hessian、梯度和上下界即可。
         omni_.solver.solveProblem();
 
         Eigen::VectorXd sol = omni_.solver.getSolution();
@@ -387,7 +393,7 @@ struct LMPC::Impl {
             return;
         }
 
-        /* output velocity */
+        /* 输出速度序列 */
 
         for (int i = 0; i < steps; ++i) {
             int ui = dimx + 2 * i;
@@ -405,6 +411,7 @@ struct LMPC::Impl {
             RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "get_ref failed");
             return std::nullopt;
         }
+        // 将连续轨迹采样成 MPC 预测时域中的位置参考和速度前馈参考。
         for (int i = 0; i < P_.size(); i++) {
             omni_.xref(0, i) = P_[i].pos.x();
             omni_.xref(1, i) = P_[i].pos.y();
@@ -428,6 +435,7 @@ struct LMPC::Impl {
                     du += std::fabs(omni_.output(1, c) - omni_.last_output(1, c));
                 }
                 if (du < 1e-4) {
+                    // 控制序列变化已经很小，提前退出以节省控制周期内的计算时间。
                     break;
                 }
             }

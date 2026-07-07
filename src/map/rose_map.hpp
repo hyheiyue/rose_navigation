@@ -13,6 +13,8 @@ public:
         return std::make_shared<RoseMap>(node);
     }
     ~RoseMap();
+    // 三层地图接口：OccMap 保存 3D 概率占据，BinMap 投影为 2D 可通行性，
+    // ESDF 在 BinMap 上计算到障碍物的有符号距离，供规划器快速查询安全距离。
     OccMap::Ptr occ_map() const;
     BinMap::Ptr bin_map() const;
     ESDF::Ptr esdf() const;

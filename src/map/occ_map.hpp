@@ -25,6 +25,7 @@ namespace rose_nav::map {
 class OccMap {
 public:
     struct Frame {
+        // 单帧点云的时间戳、点集和传感器原点，原点用于 ray clearing。
         double time;
         std::vector<Eigen::Vector3f> pts;
         Eigen::Vector3f sensor_origin;
@@ -32,6 +33,7 @@ public:
     using Ptr = std::shared_ptr<OccMap>;
 
     struct Cell {
+        // log_odds > occ_th 时视为占据；last_update 用于让过期障碍自动失效。
         float log_odds = 0.f;
         double last_update = -1;
         void reset() {
@@ -62,6 +64,7 @@ public:
     std::vector<int> get_occupied_idx() const noexcept;
     SlidingVoxelMap<3, Cell>::Ptr get_voxel_map() const noexcept;
     struct LogCtx {
+        // 简单的运行时统计，便于定位 receive / ray / hit / free 哪个阶段耗时异常。
         double free_cost = 0;
         double hit_cost = 0;
         double ray_cost = 0;
