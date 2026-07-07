@@ -243,7 +243,7 @@ struct SmallPointLIO::Impl {
             }
         );
         aligin_trigger_ = node_->create_service<std_srvs::srv::Trigger>(
-            "reset",
+            "algin",
             [this](
                 const std_srvs::srv::Trigger::Request::SharedPtr /**/,
                 std_srvs::srv::Trigger::Response::SharedPtr /**/
@@ -748,9 +748,7 @@ struct SmallPointLIO::Impl {
             auto robot_to_base_opt = tf_->get_tf2_transform(
                 params_.robot_base_frame,
                 params_.base_frame,
-                time_msg
-
-                ,
+                time_msg,
                 rclcpp::Duration::from_seconds(0.1)
             );
             if (robot_to_base_opt) {
