@@ -36,6 +36,7 @@ rose_navigation_lm_node:
       satu_gyro: 35.0                            # IMU的角速度饱和阈值
       acc_norm: 1.0                             # IMU的加速度模长
 
+      max_iter: 3
       # 地图
       map_resolution: 0.1                        # 地图分辨率
       init_map_size: 1000                          # 接收到多少个点才初始化地图

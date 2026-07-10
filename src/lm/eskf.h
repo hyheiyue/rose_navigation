@@ -76,6 +76,19 @@ struct point_measurement_result { // NOLINT(cppcoreguidelines-pro-type-member-in
     state::value_type laser_point_cov;
 };
 
+struct batch_measurement_result {
+    int effective_count = 0;
+    Eigen::Matrix<state::value_type, 12, 12> HTRH =
+        Eigen::Matrix<state::value_type, 12, 12>::Zero();
+    Eigen::Matrix<state::value_type, 12, 1> HTRz = Eigen::Matrix<state::value_type, 12, 1>::Zero();
+
+    void reset() {
+        effective_count = 0;
+        HTRH.setZero();
+        HTRz.setZero();
+    }
+};
+
 struct imu_measurement_result { // NOLINT(cppcoreguidelines-pro-type-member-init)
     bool satu_check[6];
     Eigen::Matrix<state::value_type, 6, 1> z;
@@ -87,10 +100,10 @@ class eskf {
 public:
     using measurement_model_point = std::function<void(const state&, point_measurement_result&)>;
     using measurement_model_imu = std::function<void(const state&, imu_measurement_result&)>;
-    using measurement_model_batch =
-        std::function<void(const state&, std::vector<point_measurement_result>&)>;
+    using measurement_model_batch = std::function<void(const state&, batch_measurement_result&)>;
     state x;
     Eigen::Matrix<state::value_type, state::DIM, state::DIM> P;
+    int max_iter = 4;
 
 private:
     double time_predict_state_last = 0.0;
@@ -167,87 +180,86 @@ public:
         return true;
     }
     inline bool update_iterated_batch() {
-        x.batch_iter = 0;
-
-        const state::value_type eps = static_cast<state::value_type>(1e-9);
-        const state::value_type one = static_cast<state::value_type>(1);
-
-        std::vector<point_measurement_result> results;
-
-        Eigen::Matrix<state::value_type, state::DIM, state::DIM> Lambda = P.inverse();
-
         constexpr int K = 12;
+        constexpr int Rest = state::DIM - K;
+        constexpr int max_iter = 4;
+        constexpr state::value_type convergence_eps = static_cast<state::value_type>(1e-4);
 
-        using VecK = Eigen::Matrix<state::value_type, K, 1>;
         using MatK = Eigen::Matrix<state::value_type, K, K>;
+        using VecK = Eigen::Matrix<state::value_type, K, 1>;
+        using MatR = Eigen::Matrix<state::value_type, Rest, Rest>;
+        using VecR = Eigen::Matrix<state::value_type, Rest, 1>;
+        using MatKR = Eigen::Matrix<state::value_type, K, Rest>;
+        using MatRK = Eigen::Matrix<state::value_type, Rest, K>;
+        using VecX = Eigen::Matrix<state::value_type, state::DIM, 1>;
+        using MatX = Eigen::Matrix<state::value_type, state::DIM, state::DIM>;
 
         bool any_update = false;
+        MatK last_A12 = MatK::Zero();
+        const MatX Lambda_prior = P.inverse();
+        const MatK Laa = Lambda_prior.template topLeftCorner<K, K>();
+        const MatKR Lab = Lambda_prior.template block<K, Rest>(0, K);
+        const MatRK Lba = Lambda_prior.template block<Rest, K>(K, 0);
+        const MatR Lbb = Lambda_prior.template bottomRightCorner<Rest, Rest>();
+        Eigen::LDLT<MatR> ldlt_b(Lbb);
+        if (ldlt_b.info() != Eigen::Success) {
+            return false;
+        }
+        const MatRK Lbb_inv_Lba = ldlt_b.solve(Lba);
+        const MatK prior_schur = Laa - Lab * Lbb_inv_Lba;
+        VecX iterated_dx = VecX::Zero();
+        batch_measurement_result batch_result;
 
-        results.clear();
-        h_batch(x, results);
+        for (int iter = 0; iter < max_iter; ++iter) {
+            x.batch_iter = iter;
 
-        MatK A12 = MatK::Zero();
-        Eigen::Matrix<state::value_type, state::DIM, 1> b =
-            Eigen::Matrix<state::value_type, state::DIM, 1>::Zero();
+            batch_result.reset();
+            h_batch(x, batch_result);
 
-        std::vector<VecK> rank_vs;
-        rank_vs.reserve(results.size());
+            if (batch_result.effective_count <= 0) {
+                break;
+            }
 
-        int effective_cnt = 0;
+            VecX b = -Lambda_prior * iterated_dx;
+            b.template head<K>().noalias() += batch_result.HTRz;
 
-        for (const auto& meas: results) {
-            if (!meas.valid)
-                continue;
+            const VecK b_a = b.template head<K>();
+            const VecR b_b = b.template tail<Rest>();
+            const VecR Lbb_inv_b_b = ldlt_b.solve(b_b);
 
-            ++effective_cnt;
+            MatK schur = prior_schur + batch_result.HTRH;
+            VecK rhs_a = b_a - Lab * Lbb_inv_b_b;
 
-            const auto& H = meas.H;
-            const auto& z = meas.z;
-            const auto& R = meas.laser_point_cov;
-            const auto& count = meas.count;
+            Eigen::LDLT<MatK> ldlt_schur(schur);
+            if (ldlt_schur.info() != Eigen::Success)
+                return false;
 
-            const state::value_type invR = one / std::max(R, eps);
-            const state::value_type w = invR * count;
-
-            b.template head<K>().noalias() += H.transpose() * (w * z);
-            A12.noalias() += H.transpose() * (H * w);
-
-            state::value_type s = std::sqrt(w);
-            VecK v = H.transpose() * s;
-            rank_vs.push_back(v);
+            VecX dx = VecX::Zero();
+            dx.template head<K>() = ldlt_schur.solve(rhs_a);
+            dx.template tail<Rest>() = ldlt_b.solve(b_b - Lba * dx.template head<K>());
+            if (!dx.allFinite()) {
+                return any_update;
+            }
+            x.plus(dx);
+            iterated_dx += dx;
+            last_A12 = batch_result.HTRH;
+            any_update = true;
+            if (dx.norm() < convergence_eps) {
+                break;
+            }
         }
 
-        if (effective_cnt <= 0)
+        if (!any_update) {
             return false;
-
-        Eigen::LDLT<Eigen::Matrix<state::value_type, state::DIM, state::DIM>> ldlt(Lambda);
-
-        if (ldlt.info() != Eigen::Success)
-            return false;
-
-        Eigen::Matrix<state::value_type, state::DIM, 1> u_full =
-            Eigen::Matrix<state::value_type, state::DIM, 1>::Zero();
-
-        for (const auto& v12: rank_vs) {
-            u_full.template head<K>() = v12;
-            ldlt.rankUpdate(u_full, static_cast<state::value_type>(1.0));
-            u_full.template head<K>().setZero();
         }
 
-        Eigen::Matrix<state::value_type, state::DIM, 1> dx = ldlt.solve(b);
+        MatX Lambda = Lambda_prior;
+        Lambda.topLeftCorner<K, K>() += last_A12;
 
-        x.plus(dx);
-
-        // covariance update (same approximation as original)
-        Lambda.topLeftCorner<K, K>() += A12;
-
-        any_update = true;
-
-        Eigen::LDLT<Eigen::Matrix<state::value_type, state::DIM, state::DIM>> final_ldlt(Lambda);
+        Eigen::LDLT<MatX> final_ldlt(Lambda);
 
         if (final_ldlt.info() == Eigen::Success) {
-            Eigen::Matrix<state::value_type, state::DIM, state::DIM> I =
-                Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Identity();
+            MatX I = MatX::Identity();
             P = final_ldlt.solve(I);
         } else {
             P = Lambda.inverse();

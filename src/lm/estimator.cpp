@@ -6,10 +6,12 @@
 
 #include "estimator.h"
 #include "lm/eskf.h"
+#include "lm/small_ivox.h"
+#include "lm/small_oct_vox.hpp"
 #include "utils/io/pcd_io.h"
 #include <tbb/tbb.h>
 namespace rose_nav::lm {
-constexpr int NUM_MATCH_POINTS = 100;
+constexpr int NUM_MATCH_POINTS = 1000;
 constexpr int MIN_MATCH_POINTS = 5;
 Estimator::Estimator(const ParamsNode& config) {
     params_.load(config);
@@ -25,11 +27,13 @@ Estimator::Estimator(const ParamsNode& config) {
         [this](auto&& s, auto&& measurement_result) { return h_imu(s, measurement_result); },
         [this](auto&& s, auto&& measurement_result) { return h_batch(s, measurement_result); }
     );
+    kf.max_iter = params_.max_iter;
     reset();
 }
 
 void Estimator::reset() {
-    ivox = std::make_shared<SmallIVox>(params_.map_resolution, 1000000);
+    ivox = std::make_shared<SmallOctVox>(params_.map_resolution, 1000000);
+    batch_iter_cache_.clear();
     if (params_.use_priori_pcd_add_ivox) {
         std::vector<Eigen::Vector3f> pointcloud;
         if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
@@ -99,13 +103,15 @@ Estimator::process_noise_cov() const {
     return cov;
 }
 
-void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& results) noexcept {
+void Estimator::h_batch(const state& s, batch_measurement_result& result) noexcept {
     const size_t N = current_batch.points.size();
 
-    results.clear();
-    results.resize(N);
+    result.reset();
 
     points_odom_frame.assign(N, Eigen::Vector3f::Zero());
+    if (s.batch_iter == 0 || batch_iter_cache_.size() != N) {
+        batch_iter_cache_.assign(N, IterCache());
+    }
 
     const bool ext_on = params_.extrinsic_est_en;
 
@@ -123,9 +129,13 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
     tbb::enumerable_thread_specific<Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>> local_solver(
         [] { return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(); }
     );
+    tbb::enumerable_thread_specific<batch_measurement_result> local_results([] {
+        return batch_measurement_result {};
+    });
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, N), [&](const tbb::blocked_range<size_t>& r) {
         auto& solver = local_solver.local();
+        auto& local_result = local_results.local();
 
         for (size_t i = r.begin(); i != r.end(); ++i) {
             const auto& p = current_batch.points[i];
@@ -136,75 +146,86 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
             const Eigen::Vector3d pt_imu_d = R_LI * p.position.cast<double>() + T_LI;
 
             Eigen::Matrix3d R_delta = Eigen::Matrix3d::Identity();
-            if (w.norm() > 1e-8) {
-                R_delta = exp<double>(w * dt);
-            }
+
+            R_delta = exp<double>(w * dt);
 
             // 先将每个点去畸变到当前批次时间，再搜索局部地图平面。
             const Eigen::Vector3d pt_odom_d = (kf_rot * R_delta) * pt_imu_d + kf_pos + kf_vel * dt;
 
             points_odom_frame[i] = pt_odom_d.cast<float>();
+            const SmallOctVox::PositionIndex voxel_idx =
+                ivox->get_position_index(points_odom_frame[i]);
 
-            std::vector<Eigen::Vector3f> near;
-            ivox->get_closest_point(points_odom_frame[i], near, NUM_MATCH_POINTS);
+            Eigen::Vector3d n;
+            double d_plane = 0.0;
+            auto& iter_cache = batch_iter_cache_[i];
+            if (s.batch_iter > 0 && iter_cache.valid
+                && (voxel_idx.array() == iter_cache.voxel_index.array()).all())
+            {
+                n = iter_cache.normal;
+                d_plane = iter_cache.plane_d;
+            } else {
+                iter_cache.voxel_index = voxel_idx;
+                iter_cache.valid = false;
 
-            if (near.size() < MIN_MATCH_POINTS) {
-                continue;
+                std::vector<Eigen::Vector3f> near;
+                ivox->get_closest_point(points_odom_frame[i], near, NUM_MATCH_POINTS);
+                if (near.size() < MIN_MATCH_POINTS) {
+                    continue;
+                }
+
+                Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+                for (const auto& np: near) {
+                    centroid += np.cast<double>();
+                }
+                centroid /= static_cast<double>(near.size());
+
+                Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+                for (const auto& np: near) {
+                    const Eigen::Vector3d d = np.cast<double>() - centroid;
+                    cov.noalias() += d * d.transpose();
+                }
+
+                if (near.size() <= 1) {
+                    continue;
+                }
+                cov /= static_cast<double>(near.size() - 1);
+
+                // 邻域协方差矩阵的最小特征向量即拟合平面的法向量。
+                solver.compute(cov);
+                n = solver.eigenvectors().col(0);
+                d_plane = -n.dot(centroid);
+
+                if (s.batch_iter == 0) {
+                    const double pt_norm = current_batch.points[i].position.norm();
+
+                    // 首轮迭代先过滤弱匹配；后续迭代基于更精确的状态，
+                    // 可以更直接地使用残差。
+                    const double d_signed_first = n.dot(pt_odom_d) + d_plane;
+                    if (pt_norm <= match_s * d_signed_first * d_signed_first) {
+                        continue;
+                    }
+
+                    bool valid = true;
+                    for (const auto& np: near) {
+                        if (std::abs(n.dot(np.cast<double>()) + d_plane) > plane_thr) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (!valid) {
+                        continue;
+                    }
+                }
+                iter_cache.normal = n;
+                iter_cache.plane_d = d_plane;
+                iter_cache.valid = true;
             }
-
-            Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
-            for (const auto& np: near) {
-                centroid += np.cast<double>();
-            }
-            centroid /= static_cast<double>(near.size());
-
-            Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-            for (const auto& np: near) {
-                const Eigen::Vector3d d = np.cast<double>() - centroid;
-                cov.noalias() += d * d.transpose();
-            }
-
-            if (near.size() <= 1) {
-                continue;
-            }
-            cov /= static_cast<double>(near.size() - 1);
-
-            // 邻域协方差矩阵的最小特征向量即拟合平面的法向量。
-            solver.compute(cov);
-            const Eigen::Vector3d n = solver.eigenvectors().col(0);
-            const double d_plane = -n.dot(centroid);
 
             const double d_signed = n.dot(pt_odom_d) + d_plane;
 
-            if (s.batch_iter == 0) {
-                const double pt_norm = current_batch.points[i].position.norm();
-
-                // 首轮迭代先过滤弱匹配；后续迭代基于更精确的状态，
-                // 可以更直接地使用残差。
-                if (pt_norm <= match_s * d_signed * d_signed) {
-                    continue;
-                }
-
-                bool valid = true;
-                for (const auto& np: near) {
-                    if (std::abs(n.dot(np.cast<double>()) + d_plane) > plane_thr) {
-                        valid = false;
-                        break;
-                    }
-                }
-                if (!valid) {
-                    continue;
-                }
-            }
-
-            point_measurement_result mr {};
-            mr.valid = true;
-            // 量测残差采用点到平面的有符号距离，z 取负值以匹配滤波器更新方向。
-            mr.z = -d_signed;
-            mr.laser_point_cov = laser_cov;
-            mr.count = current_batch.points[i].count;
-
             const Eigen::Matrix<state::value_type, 3, 1> normal0 = n.cast<state::value_type>();
+            Eigen::Matrix<state::value_type, 1, 12> H;
 
             if (ext_on) {
                 // 开启外参估计时，在点到平面 Jacobian 的位姿项后追加
@@ -219,17 +240,30 @@ void Estimator::h_batch(const state& s, std::vector<point_measurement_result>& r
                         s.offset_R_L_I.transpose() * C
                     );
 
-                mr.H << normal0.transpose(), A.transpose(), B.transpose(), C.transpose();
+                H << normal0.transpose(), A.transpose(), B.transpose(), C.transpose();
             } else {
                 const Eigen::Matrix<state::value_type, 3, 1> A =
                     pt_imu_d.cast<state::value_type>().cross(s.rotation.transpose() * normal0);
 
-                mr.H << normal0.transpose(), A.transpose(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+                H << normal0.transpose(), A.transpose(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
             }
 
-            results[i] = mr;
+            const state::value_type invR = static_cast<state::value_type>(1)
+                / std::max(static_cast<state::value_type>(laser_cov),
+                           static_cast<state::value_type>(1e-9));
+            const state::value_type weight =
+                invR * static_cast<state::value_type>(current_batch.points[i].count);
+            local_result.HTRH.noalias() += H.transpose() * (H * weight);
+            local_result.HTRz.noalias() += H.transpose() * (weight * -d_signed);
+            ++local_result.effective_count;
         }
     });
+
+    for (const auto& local_result: local_results) {
+        result.HTRH.noalias() += local_result.HTRH;
+        result.HTRz.noalias() += local_result.HTRz;
+        result.effective_count += local_result.effective_count;
+    }
 }
 
 void Estimator::h_point(const state& s, point_measurement_result& measurement_result) {

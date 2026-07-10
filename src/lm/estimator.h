@@ -8,10 +8,12 @@
 
 #include "eskf.h"
 #include "lm/common.hpp"
+#include "lm/small_oct_vox.hpp"
 #include "small_ivox.h"
 #include "utils/rclcpp_parameter_node.hpp"
 #include <Eigen/src/Core/Matrix.h>
 #include <Eigen/src/Geometry/Transform.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 namespace rose_nav::lm {
@@ -20,6 +22,7 @@ class Estimator {
 public:
     using Ptr = std::unique_ptr<Estimator>;
     struct Params {
+        int max_iter = 3;
         double map_resolution = 0.1;
         bool extrinsic_est_en = false;
         double laser_point_cov = 0.01;
@@ -46,6 +49,7 @@ public:
         std::string prior_pcd_path;
         Eigen::Isometry3d init_pose_in_prior_pcd;
         void load(const ParamsNode& config) {
+            max_iter = config.declare<int>("max_iter");
             map_resolution = config.declare<double>("map_resolution");
             extrinsic_est_en = config.declare<bool>("extrinsic_est_en");
             laser_point_cov = config.declare<double>("laser_point_cov");
@@ -98,7 +102,7 @@ public:
 
     eskf kf;
     // h_point / h_batch 使用的局部地图与点到平面匹配缓存。
-    std::shared_ptr<SmallIVox> ivox;
+    std::shared_ptr<SmallOctVox> ivox;
     Eigen::Matrix<state::value_type, 3, 1> Lidar_T_wrt_IMU;
     Eigen::Matrix<state::value_type, 3, 3> Lidar_R_wrt_IMU;
     Eigen::Vector3f point_lidar_frame;
@@ -106,6 +110,14 @@ public:
     std::vector<Eigen::Vector3f> nearest_points;
     common::Batch current_batch;
     std::vector<Eigen::Vector3f> points_odom_frame;
+    struct IterCache {
+        SmallOctVox::PositionIndex voxel_index;
+        Eigen::Vector3d normal;
+        double plane_d;
+        bool valid = false;
+    };
+    std::vector<IterCache> batch_iter_cache_;
+
     // h_imu 使用的当前 IMU 量测缓存，进入滤波器前会做尺度和饱和检查。
     Eigen::Matrix<state::value_type, 3, 1> angular_velocity;
     Eigen::Matrix<state::value_type, 3, 1> linear_acceleration;
@@ -119,7 +131,7 @@ public:
     void h_point(const state& s, point_measurement_result& measurement_result);
 
     void h_imu(const state& s, imu_measurement_result& measurement_result);
-    void h_batch(const state& s, std::vector<point_measurement_result>& results) noexcept;
+    void h_batch(const state& s, batch_measurement_result& result) noexcept;
 };
 
 } // namespace rose_nav::lm

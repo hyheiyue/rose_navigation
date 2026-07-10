@@ -516,7 +516,7 @@ struct OccMap::Impl {
     std::vector<int> occupied_pos_;
     std::vector<int> get_occupied_idx() const noexcept {
         std::lock_guard<std::mutex> lock(occupied_mutex_);
-        
+
         return occupied_buffer_idx_;
     }
     SlidingVoxelMap<3, Cell>::Ptr get_voxel_map() const noexcept {
