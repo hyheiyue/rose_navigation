@@ -149,8 +149,9 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
 
             R_delta = exp<double>(w * dt);
 
-            // 先将每个点去畸变到当前批次时间，再搜索局部地图平面。
-            const Eigen::Vector3d pt_odom_d = (kf_rot * R_delta) * pt_imu_d + kf_pos + kf_vel * dt;
+            // 先用匀速模型将每个点去畸变到当前批次时间，再搜索局部地图平面。
+            const Eigen::Vector3d pt_imu_deskew = R_delta * pt_imu_d;
+            const Eigen::Vector3d pt_odom_d = kf_rot * pt_imu_deskew + kf_pos + kf_vel * dt;
 
             points_odom_frame[i] = pt_odom_d.cast<float>();
             const SmallOctVox::PositionIndex voxel_idx =
@@ -225,34 +226,45 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
             const double d_signed = n.dot(pt_odom_d) + d_plane;
 
             const Eigen::Matrix<state::value_type, 3, 1> normal0 = n.cast<state::value_type>();
-            Eigen::Matrix<state::value_type, 1, 12> H;
+            Eigen::Matrix<state::value_type, 1, batch_measurement_result::DIM> H;
+            H.setZero();
+            const Eigen::Matrix<state::value_type, 3, 1> velocity_jac =
+                normal0 * static_cast<state::value_type>(dt);
 
             if (ext_on) {
                 // 开启外参估计时，在点到平面 Jacobian 的位姿项后追加
                 // LiDAR-IMU 旋转和平移外参的导数。
                 const Eigen::Matrix<state::value_type, 3, 1> C = s.rotation.transpose() * normal0;
+                const Eigen::Matrix<state::value_type, 3, 1> C_deskew =
+                    R_delta.cast<state::value_type>().transpose() * C;
 
                 const Eigen::Matrix<state::value_type, 3, 1> A =
-                    pt_imu_d.cast<state::value_type>().cross(C);
+                    pt_imu_deskew.cast<state::value_type>().cross(C);
 
                 const Eigen::Matrix<state::value_type, 3, 1> B =
-                    point_lidar_frame.cast<state::value_type>().cross(
-                        s.offset_R_L_I.transpose() * C
+                    p.position.cast<state::value_type>().cross(
+                        s.offset_R_L_I.transpose() * C_deskew
                     );
 
-                H << normal0.transpose(), A.transpose(), B.transpose(), C.transpose();
+                H.template segment<3>(state::position_index) = normal0.transpose();
+                H.template segment<3>(state::rotation_index) = A.transpose();
+                H.template segment<3>(state::offset_R_L_I_index) = B.transpose();
+                H.template segment<3>(state::offset_T_L_I_index) = C_deskew.transpose();
             } else {
                 const Eigen::Matrix<state::value_type, 3, 1> A =
-                    pt_imu_d.cast<state::value_type>().cross(s.rotation.transpose() * normal0);
+                    pt_imu_deskew.cast<state::value_type>().cross(s.rotation.transpose() * normal0);
 
-                H << normal0.transpose(), A.transpose(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+                H.template segment<3>(state::position_index) = normal0.transpose();
+                H.template segment<3>(state::rotation_index) = A.transpose();
             }
+            H.template segment<3>(state::velocity_index) = velocity_jac.transpose();
 
             const state::value_type invR = static_cast<state::value_type>(1)
                 / std::max(static_cast<state::value_type>(laser_cov),
                            static_cast<state::value_type>(1e-9));
-            const state::value_type weight =
-                invR * static_cast<state::value_type>(current_batch.points[i].count);
+            // const state::value_type weight =
+            //     invR * static_cast<state::value_type>(current_batch.points[i].count);
+            const state::value_type weight = invR;
             local_result.HTRH.noalias() += H.transpose() * (H * weight);
             local_result.HTRz.noalias() += H.transpose() * (weight * -d_signed);
             ++local_result.effective_count;

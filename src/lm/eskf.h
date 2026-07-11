@@ -6,6 +6,7 @@
 
 #pragma once
 #include "so3_math.h"
+#include <cmath>
 #include <iostream>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_reduce.h>
@@ -77,10 +78,12 @@ struct point_measurement_result { // NOLINT(cppcoreguidelines-pro-type-member-in
 };
 
 struct batch_measurement_result {
+    constexpr static int DIM = state::velocity_index + 3;
     int effective_count = 0;
-    Eigen::Matrix<state::value_type, 12, 12> HTRH =
-        Eigen::Matrix<state::value_type, 12, 12>::Zero();
-    Eigen::Matrix<state::value_type, 12, 1> HTRz = Eigen::Matrix<state::value_type, 12, 1>::Zero();
+    Eigen::Matrix<state::value_type, DIM, DIM> HTRH =
+        Eigen::Matrix<state::value_type, DIM, DIM>::Zero();
+    Eigen::Matrix<state::value_type, DIM, 1> HTRz =
+        Eigen::Matrix<state::value_type, DIM, 1>::Zero();
 
     void reset() {
         effective_count = 0;
@@ -111,6 +114,11 @@ private:
     measurement_model_point h_point;
     measurement_model_imu h_imu;
     measurement_model_batch h_batch;
+
+    static inline void
+    symmetrize_and_floor(Eigen::Matrix<state::value_type, state::DIM, state::DIM>& cov) {
+        cov = static_cast<state::value_type>(0.5) * (cov + cov.transpose()).eval();
+    }
 
 public:
     eskf() = default;
@@ -180,10 +188,13 @@ public:
         return true;
     }
     inline bool update_iterated_batch() {
-        constexpr int K = 12;
+        constexpr int K = batch_measurement_result::DIM;
         constexpr int Rest = state::DIM - K;
-        constexpr int max_iter = 4;
         constexpr state::value_type convergence_eps = static_cast<state::value_type>(1e-4);
+
+        constexpr state::value_type lambda_min = static_cast<state::value_type>(1e-6);
+        constexpr state::value_type lambda_max = static_cast<state::value_type>(1e6);
+        constexpr int max_lm_attempts = 6;
 
         using MatK = Eigen::Matrix<state::value_type, K, K>;
         using VecK = Eigen::Matrix<state::value_type, K, 1>;
@@ -196,6 +207,7 @@ public:
 
         bool any_update = false;
         MatK last_A12 = MatK::Zero();
+        state x_before_update = x;
         const MatX Lambda_prior = P.inverse();
         const MatK Laa = Lambda_prior.template topLeftCorner<K, K>();
         const MatKR Lab = Lambda_prior.template block<K, Rest>(0, K);
@@ -209,6 +221,7 @@ public:
         const MatK prior_schur = Laa - Lab * Lbb_inv_Lba;
         VecX iterated_dx = VecX::Zero();
         batch_measurement_result batch_result;
+        state::value_type lambda = static_cast<state::value_type>(1e-3);
 
         for (int iter = 0; iter < max_iter; ++iter) {
             x.batch_iter = iter;
@@ -230,16 +243,40 @@ public:
             MatK schur = prior_schur + batch_result.HTRH;
             VecK rhs_a = b_a - Lab * Lbb_inv_b_b;
 
-            Eigen::LDLT<MatK> ldlt_schur(schur);
-            if (ldlt_schur.info() != Eigen::Success)
-                return false;
-
             VecX dx = VecX::Zero();
-            dx.template head<K>() = ldlt_schur.solve(rhs_a);
-            dx.template tail<Rest>() = ldlt_b.solve(b_b - Lba * dx.template head<K>());
-            if (!dx.allFinite()) {
-                return any_update;
+            bool accepted = false;
+            MatK damping = MatK::Zero();
+            damping.diagonal() =
+                schur.diagonal().cwiseAbs().cwiseMax(static_cast<state::value_type>(1));
+
+            for (int attempt = 0; attempt < max_lm_attempts; ++attempt) {
+                MatK schur_damped = schur;
+                schur_damped.diagonal().noalias() += lambda * damping.diagonal();
+
+                Eigen::LDLT<MatK> ldlt_schur(schur_damped);
+                if (ldlt_schur.info() != Eigen::Success) {
+                    lambda = std::min(lambda * static_cast<state::value_type>(10), lambda_max);
+                    continue;
+                }
+
+                VecX candidate_dx = VecX::Zero();
+                candidate_dx.template head<K>() = ldlt_schur.solve(rhs_a);
+                candidate_dx.template tail<Rest>() =
+                    ldlt_b.solve(b_b - Lba * candidate_dx.template head<K>());
+
+                dx = candidate_dx;
+                accepted = true;
+                lambda = std::max(lambda / static_cast<state::value_type>(3), lambda_min);
+                break;
             }
+
+            if (!accepted) {
+                if (!any_update) {
+                    x = x_before_update;
+                }
+                break;
+            }
+
             x.plus(dx);
             iterated_dx += dx;
             last_A12 = batch_result.HTRH;
@@ -264,6 +301,7 @@ public:
         } else {
             P = Lambda.inverse();
         }
+        symmetrize_and_floor(P);
 
         return any_update;
     }
