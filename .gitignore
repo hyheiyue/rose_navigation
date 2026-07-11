@@ -24,5 +24,7 @@ __pycache__
 
 *.pdf
 
-
+.codex
+.agents
+codex
 bin
