@@ -13,7 +13,10 @@
 #include "utils/rclcpp_parameter_node.hpp"
 #include <Eigen/src/Core/Matrix.h>
 #include <Eigen/src/Geometry/Transform.h>
+#include <tbb/concurrent_hash_map.h>
 #include <cstdint>
+#include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 namespace rose_nav::lm {
@@ -110,13 +113,30 @@ public:
     std::vector<Eigen::Vector3f> nearest_points;
     common::Batch current_batch;
     std::vector<Eigen::Vector3f> points_odom_frame;
-    struct IterCache {
-        SmallOctVox::PositionIndex voxel_index;
+    struct PlaneCache {
         Eigen::Vector3d normal;
         double plane_d;
-        bool valid = false;
     };
-    std::vector<IterCache> batch_iter_cache_;
+    struct VoxelIndexHashCompare {
+        [[nodiscard]] static size_t hash(const SmallOctVox::PositionIndex& index) noexcept {
+            size_t seed = 0;
+            for (int k = 0; k < 3; ++k) {
+                const size_t value = std::hash<int> {}(index[k]);
+                seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+            }
+            return seed;
+        }
+
+        [[nodiscard]] static bool equal(
+            const SmallOctVox::PositionIndex& lhs,
+            const SmallOctVox::PositionIndex& rhs
+        ) noexcept {
+            return (lhs.array() == rhs.array()).all();
+        }
+    };
+    using BatchPlaneCache =
+        tbb::concurrent_hash_map<SmallOctVox::PositionIndex, PlaneCache, VoxelIndexHashCompare>;
+    BatchPlaneCache batch_plane_cache_;
 
     // h_imu 使用的当前 IMU 量测缓存，进入滤波器前会做尺度和饱和检查。
     Eigen::Matrix<state::value_type, 3, 1> angular_velocity;

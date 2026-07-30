@@ -33,7 +33,7 @@ Estimator::Estimator(const ParamsNode& config) {
 
 void Estimator::reset() {
     ivox = std::make_shared<SmallOctVox>(params_.map_resolution, 1000000);
-    batch_iter_cache_.clear();
+    batch_plane_cache_.clear();
     if (params_.use_priori_pcd_add_ivox) {
         std::vector<Eigen::Vector3f> pointcloud;
         if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
@@ -109,8 +109,8 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
     result.reset();
 
     points_odom_frame.assign(N, Eigen::Vector3f::Zero());
-    if (s.batch_iter == 0 || batch_iter_cache_.size() != N) {
-        batch_iter_cache_.assign(N, IterCache());
+    if (s.batch_iter == 0) {
+        batch_plane_cache_.clear();
     }
 
     const bool ext_on = params_.extrinsic_est_en;
@@ -159,15 +159,13 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
 
             Eigen::Vector3d n;
             double d_plane = 0.0;
-            auto& iter_cache = batch_iter_cache_[i];
-            if (s.batch_iter > 0 && iter_cache.valid
-                && (voxel_idx.array() == iter_cache.voxel_index.array()).all())
-            {
-                n = iter_cache.normal;
-                d_plane = iter_cache.plane_d;
+
+            BatchPlaneCache::const_accessor cached_plane;
+            if (batch_plane_cache_.find(cached_plane, voxel_idx)) {
+                n = cached_plane->second.normal;
+                d_plane = cached_plane->second.plane_d;
             } else {
-                iter_cache.voxel_index = voxel_idx;
-                iter_cache.valid = false;
+                cached_plane.release();
 
                 std::vector<Eigen::Vector3f> near;
                 ivox->get_closest_point(points_odom_frame[i], near, NUM_MATCH_POINTS);
@@ -218,9 +216,15 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
                         continue;
                     }
                 }
-                iter_cache.normal = n;
-                iter_cache.plane_d = d_plane;
-                iter_cache.valid = true;
+
+                BatchPlaneCache::accessor inserted_plane;
+                if (batch_plane_cache_.insert(inserted_plane, voxel_idx)) {
+                    inserted_plane->second.normal = n;
+                    inserted_plane->second.plane_d = d_plane;
+                } else {
+                    n = inserted_plane->second.normal;
+                    d_plane = inserted_plane->second.plane_d;
+                }
             }
 
             const double d_signed = n.dot(pt_odom_d) + d_plane;
