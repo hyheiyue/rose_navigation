@@ -113,9 +113,10 @@ public:
     std::vector<Eigen::Vector3f> nearest_points;
     common::Batch current_batch;
     std::vector<Eigen::Vector3f> points_odom_frame;
-    struct PlaneCache {
+    struct PlaneInfo {
         Eigen::Vector3d normal;
-        double plane_d;
+        double plane_d = 0.0;
+        bool valid = false;
     };
     struct VoxelIndexHashCompare {
         [[nodiscard]] static size_t hash(const SmallOctVox::PositionIndex& index) noexcept {
@@ -134,9 +135,17 @@ public:
             return (lhs.array() == rhs.array()).all();
         }
     };
-    using BatchPlaneCache =
-        tbb::concurrent_hash_map<SmallOctVox::PositionIndex, PlaneCache, VoxelIndexHashCompare>;
-    BatchPlaneCache batch_plane_cache_;
+    using PlaneCache =
+        tbb::concurrent_hash_map<SmallOctVox::PositionIndex, PlaneInfo, VoxelIndexHashCompare>;
+    PlaneCache batch_plane_cache_;
+    PlaneCache point_plane_cache_;
+    static void cache_plane(
+        PlaneCache& cache,
+        const SmallOctVox::PositionIndex& voxel_idx,
+        const Eigen::Vector3d& normal,
+        double plane_d,
+        bool valid
+    );
 
     // h_imu 使用的当前 IMU 量测缓存，进入滤波器前会做尺度和饱和检查。
     Eigen::Matrix<state::value_type, 3, 1> angular_velocity;

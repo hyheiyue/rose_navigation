@@ -9,6 +9,7 @@
 #include "lm/small_ivox.h"
 #include "lm/small_oct_vox.hpp"
 #include "utils/io/pcd_io.h"
+#include <cmath>
 #include <tbb/tbb.h>
 namespace rose_nav::lm {
 constexpr int NUM_MATCH_POINTS = 1000;
@@ -36,6 +37,7 @@ Estimator::Estimator(const ParamsNode& config) {
 void Estimator::reset() {
     ivox = std::make_shared<SmallOctVox>(params_.map_resolution, 1000000);
     batch_plane_cache_.clear();
+    point_plane_cache_.clear();
     if (params_.use_priori_pcd_add_ivox) {
         std::vector<Eigen::Vector3f> pointcloud;
         if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
@@ -56,7 +58,7 @@ void Estimator::reset() {
                 }
             );
             for (const auto& p: pointcloud) {
-                ivox->add_point(p);
+                (void)ivox->add_point(p);
             }
             RCLCPP_INFO(
                 rclcpp::get_logger("rose_nav::lm"),
@@ -105,6 +107,23 @@ Estimator::process_noise_cov() const {
     return cov;
 }
 
+void Estimator::cache_plane(
+    PlaneCache& cache,
+    const SmallOctVox::PositionIndex& voxel_idx,
+    const Eigen::Vector3d& normal,
+    double plane_d,
+    bool valid
+) {
+    PlaneCache::accessor plane;
+    cache.insert(plane, voxel_idx);
+    if (!valid && plane->second.valid) {
+        return;
+    }
+    plane->second.normal = normal;
+    plane->second.plane_d = plane_d;
+    plane->second.valid = valid;
+}
+
 void Estimator::h_batch(const state& s, batch_measurement_result& result) noexcept {
     const size_t N = current_batch.points.size();
 
@@ -135,10 +154,16 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
     tbb::enumerable_thread_specific<batch_measurement_result> local_results([] {
         return batch_measurement_result {};
     });
+    tbb::enumerable_thread_specific<std::vector<Eigen::Vector3f>> local_near_points([] {
+        std::vector<Eigen::Vector3f> near;
+        near.reserve(NUM_MATCH_POINTS);
+        return near;
+    });
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, N), [&](const tbb::blocked_range<size_t>& r) {
         auto& solver = local_solver.local();
         auto& local_result = local_results.local();
+        auto& near = local_near_points.local();
 
         for (size_t i = r.begin(); i != r.end(); ++i) {
             const auto& p = current_batch.points[i];
@@ -163,16 +188,20 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
             Eigen::Vector3d n;
             double d_plane = 0.0;
 
-            BatchPlaneCache::const_accessor cached_plane;
+            PlaneCache::const_accessor cached_plane;
             if (batch_plane_cache_.find(cached_plane, voxel_idx)) {
+                if (!cached_plane->second.valid) {
+                    continue;
+                }
                 n = cached_plane->second.normal;
                 d_plane = cached_plane->second.plane_d;
             } else {
                 cached_plane.release();
 
-                std::vector<Eigen::Vector3f> near;
+                near.clear();
                 ivox->get_closest_point(points_odom_frame[i], near, NUM_MATCH_POINTS);
                 if (near.size() < MIN_MATCH_POINTS) {
+                    cache_plane(batch_plane_cache_, voxel_idx, Eigen::Vector3d::Zero(), 0.0, false);
                     continue;
                 }
 
@@ -216,19 +245,19 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
                         }
                     }
                     if (!valid) {
+                        cache_plane(
+                            batch_plane_cache_,
+                            voxel_idx,
+                            Eigen::Vector3d::Zero(),
+                            0.0,
+                            false
+                        );
                         continue;
                     }
                 }
 
-                BatchPlaneCache::accessor inserted_plane;
-                if (batch_plane_cache_.insert(inserted_plane, voxel_idx)) {
-                    // 同一批次内落在同一体素的点复用平面模型，减少近邻搜索和 PCA 次数。
-                    inserted_plane->second.normal = n;
-                    inserted_plane->second.plane_d = d_plane;
-                } else {
-                    n = inserted_plane->second.normal;
-                    d_plane = inserted_plane->second.plane_d;
-                }
+                // 同一批次内落在同一体素的点复用平面模型，减少近邻搜索和 PCA 次数。
+                cache_plane(batch_plane_cache_, voxel_idx, n, d_plane, true);
             }
 
             const double d_signed = n.dot(pt_odom_d) + d_plane;
@@ -300,42 +329,71 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
             Lidar_R_wrt_IMU * point_lidar_frame.cast<state::value_type>() + Lidar_T_wrt_IMU;
     }
     point_odom_frame = (s.rotation * point_imu_frame + s.position).cast<float>();
-    ivox->get_closest_point(point_odom_frame, nearest_points, NUM_MATCH_POINTS);
-    if (nearest_points.size() < MIN_MATCH_POINTS) {
-        return;
-    }
-    // 对近邻点做 PCA 平面拟合，后续使用点到平面的距离作为滤波器量测。
-    // 相比点到点残差，点到平面残差对低线数/非重复扫描 LiDAR 更稳定，收敛也更快。
+    // 单点模式以当前状态预测后的 odom 体素为缓存键；如果该体素已经拟合过稳定平面，
+    // 后续点或迭代重线性化可直接复用，避免重复近邻搜索和 PCA。
+    const SmallOctVox::PositionIndex voxel_idx = ivox->get_position_index(point_odom_frame);
+    Eigen::Vector3d normal_d;
+    double plane_d = 0.0;
+    bool can_reuse_plane = false;
 
-    Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
-    for (const auto& p: nearest_points) {
-        centroid.noalias() += p;
-    }
-    centroid /= static_cast<float>(nearest_points.size());
-    Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
-    for (const auto& p: nearest_points) {
-        Eigen::Vector3f centered = p - centroid;
-        covariance.noalias() += centered * centered.transpose();
-    }
-    covariance /= static_cast<float>(nearest_points.size() - 1);
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
-    Eigen::Vector3f normal = solver.eigenvectors().col(0);
-    float d = -normal.dot(centroid);
-    for (size_t j = 0; j < nearest_points.size(); j++) {
-        float point_distanace = std::abs(normal.dot(nearest_points[j]) + d);
-        if (point_distanace > params_.plane_threshold) {
-            // 邻域点自身都不能很好落在同一平面时，说明该匹配不稳定，直接丢弃。
+    PlaneCache::const_accessor cached_plane;
+    if (point_plane_cache_.find(cached_plane, voxel_idx)) {
+        if (!cached_plane->second.valid) {
             return;
         }
+        normal_d = cached_plane->second.normal;
+        plane_d = cached_plane->second.plane_d;
+        const double cached_dist = normal_d.dot(point_odom_frame.cast<double>()) + plane_d;
+        // 缓存平面必须仍能解释当前点；残差过大说明状态变化或地图更新后平面已不适用。
+        can_reuse_plane = std::isfinite(cached_dist)
+            && std::abs(cached_dist) <= params_.plane_threshold;
+        cached_plane.release();
     }
-    float point_distanace = normal.dot(point_odom_frame) + d;
+
+    if (!can_reuse_plane) {
+        ivox->get_closest_point(point_odom_frame, nearest_points, NUM_MATCH_POINTS);
+        if (nearest_points.size() < MIN_MATCH_POINTS) {
+            cache_plane(point_plane_cache_, voxel_idx, Eigen::Vector3d::Zero(), 0.0, false);
+            return;
+        }
+        // 对近邻点做 PCA 平面拟合，后续使用点到平面的距离作为滤波器量测。
+        // 相比点到点残差，点到平面残差对低线数/非重复扫描 LiDAR 更稳定，收敛也更快。
+
+        Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+        for (const auto& p: nearest_points) {
+            centroid.noalias() += p.cast<double>();
+        }
+        centroid /= static_cast<double>(nearest_points.size());
+        Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+        for (const auto& p: nearest_points) {
+            Eigen::Vector3d centered = p.cast<double>() - centroid;
+            covariance.noalias() += centered * centered.transpose();
+        }
+        covariance /= static_cast<double>(nearest_points.size() - 1);
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+        normal_d = solver.eigenvectors().col(0);
+        plane_d = -normal_d.dot(centroid);
+        for (const auto& nearest_point: nearest_points) {
+            const double nearest_dist =
+                std::abs(normal_d.dot(nearest_point.cast<double>()) + plane_d);
+            if (nearest_dist > params_.plane_threshold) {
+                // 邻域点自身都不能很好落在同一平面时，说明该匹配不稳定，直接丢弃。
+                cache_plane(point_plane_cache_, voxel_idx, Eigen::Vector3d::Zero(), 0.0, false);
+                return;
+            }
+        }
+
+        cache_plane(point_plane_cache_, voxel_idx, normal_d, plane_d, true);
+    }
+
+    const double point_distanace = normal_d.dot(point_odom_frame.cast<double>()) + plane_d;
     if (point_lidar_frame.norm() <= params_.match_sqaured * point_distanace * point_distanace) {
         return;
     }
     // 计算点到平面残差及其对状态量的 Jacobian。
     measurement_result.laser_point_cov = static_cast<state::value_type>(params_.laser_point_cov);
     if (params_.extrinsic_est_en) {
-        Eigen::Matrix<state::value_type, 3, 1> normal0 = normal.cast<state::value_type>();
+        Eigen::Matrix<state::value_type, 3, 1> normal0 = normal_d.cast<state::value_type>();
         Eigen::Matrix<state::value_type, 3, 1> C = s.rotation.transpose() * normal0;
         Eigen::Matrix<state::value_type, 3, 1> A, B;
         A.noalias() = point_imu_frame.cross(C);
@@ -344,12 +402,12 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
         // 外参在线估计时，H 同时包含车体位姿和 LiDAR-IMU 外参的扰动项。
         measurement_result.H << normal0.transpose(), A.transpose(), B.transpose(), C.transpose();
     } else {
-        Eigen::Matrix<state::value_type, 3, 1> normal0 = normal.cast<state::value_type>();
+        Eigen::Matrix<state::value_type, 3, 1> normal0 = normal_d.cast<state::value_type>();
         Eigen::Matrix<state::value_type, 3, 1> A;
         A.noalias() = point_imu_frame.cross(s.rotation.transpose() * normal0);
         measurement_result.H << normal0.transpose(), A.transpose(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
     }
-    measurement_result.z = -point_distanace;
+    measurement_result.z = -static_cast<state::value_type>(point_distanace);
     measurement_result.valid = true;
 }
 

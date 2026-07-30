@@ -18,18 +18,18 @@ namespace rose_nav::lm {
 template<int K, typename Point>
 class KNNHeap {
 public:
-    KNNHeap() {
+    inline __attribute__((always_inline)) KNNHeap() {
         reset();
     }
 
-    void reset() {
+    inline __attribute__((always_inline)) void reset() {
         count = 0;
         worst_ = 0;
         max_dist2_ = 0.0f;
         std::memset(dist2_, 0, sizeof(dist2_));
     }
 
-    void try_insert(float dist2, const Point& point) {
+    inline __attribute__((always_inline)) void try_insert(float dist2, const Point& point) {
         const bool not_full = count < K;
         const bool should_insert = not_full || dist2 < max_dist2_;
         if (!should_insert) {
@@ -52,7 +52,7 @@ public:
         update_worst_unrolled();
     }
 
-    [[nodiscard]] float max_dist2() const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) float max_dist2() const noexcept {
         return max_dist2_;
     }
 
@@ -63,7 +63,7 @@ public:
     std::array<Point, K> points_ {};
 
 private:
-    void update_worst_unrolled() {
+    inline __attribute__((always_inline)) void update_worst_unrolled() {
         static_assert(K == 5, "update_worst_unrolled is specialized for KNNHeap<5>");
 
         const float d0 = dist2_[0];
@@ -93,7 +93,7 @@ public:
     using PositionIndex = Eigen::Matrix<int, 3, 1>;
     using KNNHeapType = KNNHeap<5, Point>;
 
-    explicit SmallOctVox(float resolution, size_t capacity = 1000000):
+    inline explicit SmallOctVox(float resolution, size_t capacity = 1000000):
         resolution_(resolution),
         inv_resolution_(1.0f / resolution),
         sub_resolution_(resolution * 0.5f),
@@ -108,7 +108,7 @@ public:
         }
     }
 
-    bool add_point(const Point& point) {
+    [[nodiscard]] inline bool add_point(const Point& point) {
         const FineKey fine_key = point_to_fine_key(point);
         const Key key { floor_div2(fine_key.x), floor_div2(fine_key.y), floor_div2(fine_key.z) };
         const uint64_t hash_key = pack_key(key);
@@ -131,7 +131,7 @@ public:
         return accepted;
     }
 
-    void
+    inline void
     get_closest_point(const Point& point, std::vector<Point>& closest_points, size_t max_num = 5)
         const {
         closest_points.clear();
@@ -201,29 +201,30 @@ public:
         }
     }
 
-    void clear() {
+    inline void clear() {
         grids_.clear();
         voxels_.clear();
     }
 
-    [[nodiscard]] size_t size() const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) size_t size() const noexcept {
         return voxels_.size();
     }
 
-    [[nodiscard]] bool empty() const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) bool empty() const noexcept {
         return voxels_.empty();
     }
 
-    [[nodiscard]] float resolution() const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) float resolution() const noexcept {
         return resolution_;
     }
 
-    [[nodiscard]] PositionIndex get_position_index(const Point& point) const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) PositionIndex
+    get_position_index(const Point& point) const noexcept {
         const FineKey key = point_to_fine_key(point);
         return PositionIndex(floor_div2(key.x), floor_div2(key.y), floor_div2(key.z));
     }
 
-    void get_points(std::vector<Point>& points) const {
+    inline void get_points(std::vector<Point>& points) const {
         points.clear();
         points.reserve(voxels_.size() * kSubVoxelNum);
         for (const auto& item: voxels_) {
@@ -243,7 +244,8 @@ private:
         int y = 0;
         int z = 0;
 
-        bool operator==(const Key& other) const noexcept {
+        [[nodiscard]] inline __attribute__((always_inline)) bool
+        operator==(const Key& other) const noexcept {
             return x == other.x && y == other.y && z == other.z;
         }
     };
@@ -256,13 +258,14 @@ private:
 
     class OctVox {
     public:
-        OctVox(const Point& point, uint8_t local_idx) {
+        inline __attribute__((always_inline)) OctVox(const Point& point, uint8_t local_idx) {
             counts_.fill(0);
             points_[local_idx] = point;
             counts_[local_idx] = 1;
         }
 
-        bool add_point(const Point& point, uint8_t local_idx) {
+        [[nodiscard]] inline __attribute__((always_inline)) bool
+        add_point(const Point& point, uint8_t local_idx) {
             uint8_t& count = counts_[local_idx];
             Point& stored_point = points_[local_idx];
             if (count == 0) {
@@ -284,7 +287,8 @@ private:
             return false;
         }
 
-        bool get_point(uint8_t local_idx, Point& point) const {
+        [[nodiscard]] inline __attribute__((always_inline)) bool
+        get_point(uint8_t local_idx, Point& point) const {
             if (counts_[local_idx] == 0) {
                 return false;
             }
@@ -305,11 +309,12 @@ private:
 
     static constexpr uint8_t kSubVoxelNum = 8;
 
-    static int floor_div2(int value) noexcept {
+    [[nodiscard]] static inline __attribute__((always_inline)) int floor_div2(int value) noexcept {
         return value >= 0 ? value / 2 : (value - 1) / 2;
     }
 
-    FineKey point_to_fine_key(const Point& point) const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) FineKey
+    point_to_fine_key(const Point& point) const noexcept {
         return {
             static_cast<int>(std::floor(point.x() * sub_inv_resolution_)),
             static_cast<int>(std::floor(point.y() * sub_inv_resolution_)),
@@ -317,14 +322,16 @@ private:
         };
     }
 
-    static uint8_t fine_key_to_local_idx(const FineKey& key) noexcept {
+    [[nodiscard]] static inline __attribute__((always_inline)) uint8_t
+    fine_key_to_local_idx(const FineKey& key) noexcept {
         const uint8_t dx = static_cast<uint8_t>(key.x & 1);
         const uint8_t dy = static_cast<uint8_t>(key.y & 1);
         const uint8_t dz = static_cast<uint8_t>(key.z & 1);
         return static_cast<uint8_t>((dz << 2) | (dy << 1) | dx);
     }
 
-    static Key offset_key(const Key& base, const Key& offset, int sx, int sy, int sz) noexcept {
+    [[nodiscard]] static inline __attribute__((always_inline)) Key
+    offset_key(const Key& base, const Key& offset, int sx, int sy, int sz) noexcept {
         return {
             base.x + sx * offset.x,
             base.y + sy * offset.y,
@@ -332,7 +339,8 @@ private:
         };
     }
 
-    static uint64_t pack_key(const Key& key) noexcept {
+    [[nodiscard]] static inline __attribute__((always_inline)) uint64_t
+    pack_key(const Key& key) noexcept {
         constexpr uint64_t mask = (uint64_t { 1 } << 21) - 1;
         return (static_cast<uint64_t>(key.x) & mask) << 42
             | (static_cast<uint64_t>(key.y) & mask) << 21 | (static_cast<uint64_t>(key.z) & mask);

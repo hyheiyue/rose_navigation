@@ -1,14 +1,34 @@
 cmake_minimum_required(VERSION 3.8)
 project(rose_navigation)
 
-set(CMAKE_BUILD_TYPE "Release")
+if(POLICY CMP0069)
+    cmake_policy(SET CMP0069 NEW)
+endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    add_compile_options("-march=native")
-    add_compile_options("-ffast-math")
-    add_compile_options("-fno-math-errno")
+
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ROSE_NAV_IPO_SUPPORTED OUTPUT ROSE_NAV_IPO_ERROR)
+
+set(ROSE_NAV_RELEASE_COMPILE_OPTIONS)
+set(ROSE_NAV_RELEASE_LINK_OPTIONS)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    list(APPEND ROSE_NAV_RELEASE_COMPILE_OPTIONS
+        -O3
+        -DNDEBUG
+        -march=native
+        -ffast-math
+        -fno-math-errno
+        -fno-semantic-interposition
+    )
+    list(APPEND ROSE_NAV_RELEASE_LINK_OPTIONS
+        -Wl,-O1
+    )
 endif()
 # find dependencies
 find_package(ament_cmake_auto REQUIRED)
@@ -29,6 +49,13 @@ find_package(yaml-cpp REQUIRED)
 find_package(TBB REQUIRED)
 find_package(OsqpEigen REQUIRED)
 find_package(osqp REQUIRED)
+find_package(livox_ros_driver2 QUIET)
+if(livox_ros_driver2_FOUND)
+    message(STATUS "Found livox_ros_driver2, enabling Livox lidar support.")
+    add_definitions(-DHAVE_LIVOX_DRIVER)
+else()
+    message(WARNING "livox_ros_driver2 not found. Building without Livox lidar support.")
+endif()
 # find_package(robin REQUIRED)
 # find_package(kiss_matcher REQUIRED)
 set(OSQP_LIB_PATH /usr/local/lib/libosqp.so)  
@@ -41,6 +68,17 @@ configure_file(
 )
 file(GLOB_RECURSE SOURCE src/*.cpp 3rdparty/*.c 3rdparty/*.cpp)
 ament_auto_add_library(${PROJECT_NAME} SHARED ${SOURCE})
+target_compile_options(${PROJECT_NAME} PRIVATE
+    "$<$<CONFIG:Release>:${ROSE_NAV_RELEASE_COMPILE_OPTIONS}>"
+)
+target_link_options(${PROJECT_NAME} PRIVATE
+    "$<$<CONFIG:Release>:${ROSE_NAV_RELEASE_LINK_OPTIONS}>"
+)
+if(ROSE_NAV_IPO_SUPPORTED)
+    set_property(TARGET ${PROJECT_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+else()
+    message(STATUS "IPO/LTO is not supported: ${ROSE_NAV_IPO_ERROR}")
+endif()
 target_include_directories(${PROJECT_NAME} PUBLIC
     3rdparty
     src
@@ -70,6 +108,11 @@ ament_target_dependencies(${PROJECT_NAME}
     visualization_msgs
     nav2_msgs
 )
+if(livox_ros_driver2_FOUND)
+    ament_target_dependencies(${PROJECT_NAME}
+        livox_ros_driver2
+    )
+endif()
 
 rclcpp_components_register_node(${PROJECT_NAME}
     PLUGIN "rose_nav::SmallPointLioNode"

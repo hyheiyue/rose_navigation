@@ -173,21 +173,52 @@ public:
     }
 
     inline bool update_point() {
+        constexpr state::value_type convergence_eps = static_cast<state::value_type>(1e-4);
+        const int iter_num = max_iter > 0 ? max_iter : 1;
+        const Eigen::Matrix<state::value_type, state::DIM, state::DIM> P_prior = P;
+
+        bool any_update = false;
+        Eigen::Matrix<state::value_type, 1, 12> last_H =
+            Eigen::Matrix<state::value_type, 1, 12>::Zero();
+        Eigen::Matrix<state::value_type, state::DIM, 1> last_K =
+            Eigen::Matrix<state::value_type, state::DIM, 1>::Zero();
+
         point_measurement_result measurement_result;
-        h_point(x, measurement_result);
-        if (!measurement_result.valid) {
+        for (int iter = 0; iter < iter_num; ++iter) {
+            h_point(x, measurement_result);
+            if (!measurement_result.valid) {
+                break;
+            }
+
+            Eigen::Matrix<state::value_type, state::DIM, 1> PHT =
+                P_prior.template block<state::DIM, 12>(0, 0) * measurement_result.H.transpose();
+            state::value_type temp =
+                measurement_result.H * PHT.topRows(12) + measurement_result.laser_point_cov;
+            if (temp == 0) [[unlikely]] {
+                temp = 1e-6;
+            }
+
+            Eigen::Matrix<state::value_type, state::DIM, 1> K = PHT / temp;
+            const Eigen::Matrix<state::value_type, state::DIM, 1> dx =
+                K * measurement_result.z;
+            x.plus(dx);
+
+            last_H = measurement_result.H;
+            last_K = K;
+            any_update = true;
+
+            // 单点迭代只负责围绕更新后的状态重线性化；增量足够小时提前停止。
+            if (dx.norm() < convergence_eps) {
+                break;
+            }
+        }
+
+        if (!any_update) {
             return false;
         }
-        Eigen::Matrix<state::value_type, state::DIM, 1> PHT =
-            P.template block<state::DIM, 12>(0, 0) * measurement_result.H.transpose();
-        state::value_type temp =
-            measurement_result.H * PHT.topRows(12) + measurement_result.laser_point_cov;
-        if (temp == 0) [[unlikely]] {
-            temp = 1e-6;
-        }
-        Eigen::Matrix<state::value_type, state::DIM, 1> K = PHT / temp;
-        x.plus(K * measurement_result.z);
-        P = P - K * measurement_result.H * P.template block<12, state::DIM>(0, 0);
+
+        // 协方差只按最后一次有效线性化结果更新一次，避免同一激光点在迭代中被重复计权。
+        P = P_prior - last_K * last_H * P_prior.template block<12, state::DIM>(0, 0);
         return true;
     }
     inline bool update_iterated_batch() {

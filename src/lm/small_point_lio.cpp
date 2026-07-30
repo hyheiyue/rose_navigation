@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/logging.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -156,7 +157,7 @@ struct SmallPointLIO::Impl {
         // 让滤波、去畸变和建图逻辑保持稳定。
         if (lidar_type == "livox_custom_msg") {
 #ifdef HAVE_LIVOX_DRIVER
-            lidar_adapter = std::make_unique<LivoxCustomMsgAdapter>();
+            lidar_adapter_ = std::make_unique<LivoxCustomMsgAdapter>();
 #else
             RCLCPP_ERROR(
                 rclcpp::get_logger("rose_nav::lm"),
@@ -241,6 +242,10 @@ struct SmallPointLIO::Impl {
                 estimator_->reset();
                 if (pcd_mapping) {
                     pcd_mapping = std::make_unique<utils::PCDMapping>(0.05);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(path_mutex_);
+                    odom_path_msg_ = nav_msgs::msg::Path();
                 }
                 if (algin_source_grid_) {
                     algin_source_grid_ =
@@ -331,6 +336,7 @@ struct SmallPointLIO::Impl {
         marker_pub_ =
             node_->create_publisher<visualization_msgs::msg::MarkerArray>("/lm_marker", 10);
         odom_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 1000);
+        odom_path_pub_ = node_->create_publisher<nav_msgs::msg::Path>("/odom_path", 10);
         pointcloud_pub_ =
             node_->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 1000);
     }
@@ -384,12 +390,12 @@ struct SmallPointLIO::Impl {
                 if (params_.batch_update && !estimator_->params_.use_priori_pcd_add_ivox) {
                     for (const auto& batch: preprocess_.point_batch_deque) {
                         for (const auto& point: batch.points) {
-                            estimator_->ivox->add_point(point.position);
+                            (void)estimator_->ivox->add_point(point.position);
                         }
                     }
                 } else {
                     for (const auto& point: preprocess_.point_deque) {
-                        estimator_->ivox->add_point(point.position);
+                        (void)estimator_->ivox->add_point(point.position);
                     }
                 }
 
@@ -513,7 +519,7 @@ struct SmallPointLIO::Impl {
                     // 批量更新把一帧内的点到平面残差汇总成正规方程，降低逐点 ESKF 更新开销。
                     estimator_->kf.update_iterated_batch();
                     for (const auto& point: estimator_->points_odom_frame) {
-                        estimator_->ivox->add_point(point);
+                        (void)estimator_->ivox->add_point(point);
                     }
 
                     log_ctx_.processed_points += estimator_->points_odom_frame.size();
@@ -532,7 +538,7 @@ struct SmallPointLIO::Impl {
                     bool has_matched = estimator_->kf.update_point();
                     (void)has_matched;
                     // 单点模式每处理一个有效点就写入 iVox，使局部地图保持实时增量更新。
-                    estimator_->ivox->add_point(estimator_->point_odom_frame);
+                    (void)estimator_->ivox->add_point(estimator_->point_odom_frame);
 
                     log_ctx_.processed_points++;
                     preprocess_.point_deque.pop_front();
@@ -815,6 +821,23 @@ struct SmallPointLIO::Impl {
         marker_pub_->publish(marker_array);
         tf_->publish_transform(tf_msg);
         odom_pub_->publish(odom_msg);
+        publish_odom_path(odom_msg);
+    }
+
+    void publish_odom_path(const nav_msgs::msg::Odometry& odom_msg) {
+        if (!utils::publisher_sub(odom_path_pub_)) {
+            return;
+        }
+
+        geometry_msgs::msg::PoseStamped pose_msg;
+        pose_msg.header = odom_msg.header;
+        pose_msg.pose = odom_msg.pose.pose;
+
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        odom_path_msg_.header = odom_msg.header;
+        odom_path_msg_.header.frame_id = "odom";
+        odom_path_msg_.poses.push_back(pose_msg);
+        odom_path_pub_->publish(odom_path_msg_);
     }
 
     void voxelgrid_sampling_tbb(
@@ -1077,6 +1100,7 @@ struct SmallPointLIO::Impl {
     std::unique_ptr<LidarAdapterBase> lidar_adapter_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr odom_path_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_trigger_;
@@ -1087,6 +1111,8 @@ struct SmallPointLIO::Impl {
     RclTF::Ptr tf_;
     std::thread output_thread_;
     LockQueue<std::pair<common::Odometry, std::vector<Eigen::Vector3f>>> output_deque_;
+    nav_msgs::msg::Path odom_path_msg_;
+    std::mutex path_mutex_;
 
     std::unique_ptr<utils::PCDMapping> pcd_mapping;
     Eigen::Isometry3d lidar_to_robot_init_;

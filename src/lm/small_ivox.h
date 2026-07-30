@@ -9,18 +9,21 @@
 
 namespace rose_nav::lm {
 
-inline uint64_t hash_position_index(const Eigen::Matrix<int16_t, 3, 1>& v);
+[[nodiscard]] inline __attribute__((always_inline)) uint64_t
+hash_position_index(const Eigen::Matrix<uint16_t, 3, 1>& v);
 
 class PointWithDistance {
 public:
     Eigen::Vector3f point;
     float distance = 0;
 
-    PointWithDistance(Eigen::Vector3f point, float distance);
+    inline __attribute__((always_inline)) PointWithDistance(Eigen::Vector3f point, float distance);
 
-    bool operator()(const PointWithDistance& p1, const PointWithDistance& p2) const;
+    [[nodiscard]] inline __attribute__((always_inline)) bool
+    operator()(const PointWithDistance& p1, const PointWithDistance& p2) const;
 
-    bool operator<(const PointWithDistance& rhs) const;
+    [[nodiscard]] inline __attribute__((always_inline)) bool
+    operator<(const PointWithDistance& rhs) const;
 };
 
 class SmallIVox {
@@ -32,20 +35,22 @@ private:
     std::vector<PointWithDistance> candidates;
 
 public:
-    explicit SmallIVox(float resolution, size_t capacity);
+    inline __attribute__((always_inline)) explicit SmallIVox(float resolution, size_t capacity);
 
-    bool add_point(const Eigen::Vector3f& point_to_add);
+    [[nodiscard]] inline __attribute__((always_inline)) bool
+    add_point(const Eigen::Vector3f& point_to_add);
 
-    void get_closest_point(
+    inline __attribute__((always_inline)) void get_closest_point(
         const Eigen::Vector3f& pt,
         std::vector<Eigen::Vector3f>& closest_pt,
         size_t max_num = 5
     );
 
-    [[nodiscard]] Eigen::Matrix<uint16_t, 3, 1> get_position_index(const Eigen::Vector3f& pt) const;
+    [[nodiscard]] inline __attribute__((always_inline)) Eigen::Matrix<uint16_t, 3, 1>
+    get_position_index(const Eigen::Vector3f& pt) const;
 };
 
-inline __attribute__((always_inline)) uint64_t
+[[nodiscard]] inline __attribute__((always_inline)) uint64_t
 hash_position_index(const Eigen::Matrix<uint16_t, 3, 1>& v) {
     return (static_cast<uint64_t>(v[0]) << 32) | (static_cast<uint64_t>(v[1]) << 16)
         | static_cast<uint64_t>(v[2]);
@@ -56,13 +61,13 @@ PointWithDistance::PointWithDistance(Eigen::Vector3f point, float distance):
     point(std::move(point)),
     distance(distance) {}
 
-inline __attribute__((always_inline)) bool
+[[nodiscard]] inline __attribute__((always_inline)) bool
 PointWithDistance::operator()(const PointWithDistance& p1, const PointWithDistance& p2) const {
     return p1.distance < p2.distance;
 }
 
-inline __attribute__((always_inline)) bool PointWithDistance::operator<(const PointWithDistance& rhs
-) const {
+[[nodiscard]] inline __attribute__((always_inline)) bool
+PointWithDistance::operator<(const PointWithDistance& rhs) const {
     return distance < rhs.distance;
 }
 
