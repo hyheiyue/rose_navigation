@@ -31,6 +31,7 @@ struct OccMap::Impl {
         }
         occupied_buffer_idx_.reserve(N);
         occupied_pos_.assign(N, -1);
+        // 占据更新拆成接收、命中、空闲和射线线程，点云回调只入队，避免地图更新阻塞传感器数据。
         receive_thread_ = std::thread(std::bind(&OccMap::Impl::receive, this));
         free_thread_ = std::thread(std::bind(&OccMap::Impl::free, this));
         hit_thread_ = std::thread(std::bind(&OccMap::Impl::hit, this));
@@ -190,6 +191,7 @@ struct OccMap::Impl {
                 int tx, ty, tz, count;
 
                 inline bool should_stop(int x, int y, int z) const {
+                    // 地图内命中点本身由 hit 线程增加占据概率，DDA 只负责命中点之前的空闲体素。
                     return x == tx && y == ty && z == tz;
                 }
 
@@ -387,6 +389,7 @@ struct OccMap::Impl {
         Vec3 tMax = (dir.abs() > eps).select((nextBoundary - pos) / dir, Vec3::Constant(inf));
         for (size_t i = 0; i < max_range_vox; ++i) {
             int axis;
+            // 每次跨过最近的体素边界，从而按真实射线路径枚举经过的体素。
             tMax.minCoeff(&axis);
             c[axis] += step[axis];
             tMax[axis] += tDelta[axis];

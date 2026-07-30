@@ -142,6 +142,8 @@ struct RosePlanner::Impl {
             }
         );
         std::string goal_topic = config.declare<std::string>("goal_topic");
+        std::string goal_point_topic =
+            config.declare<std::string>("goal_point_topic", goal_topic + "_point");
         goal_sub_ = node.create_subscription<geometry_msgs::msg::PoseStamped>(
             goal_topic,
             10,
@@ -166,7 +168,7 @@ struct RosePlanner::Impl {
         );
 
         goal_point_sub_ = node.create_subscription<geometry_msgs::msg::PointStamped>(
-            goal_topic,
+            goal_point_topic,
             10,
             [this](const geometry_msgs::msg::PointStamped::SharedPtr msg) {
                 static Eigen::Isometry3d target_2_msg = Eigen::Isometry3d::Identity();

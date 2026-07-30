@@ -38,6 +38,8 @@ struct TrajOpt::Impl {
     }
     static inline bool
     smoothed_l1(const double& x, const double& mu, double& f, double& df) noexcept {
+        // 平滑 L1 用三次多项式连接零惩罚区和线性惩罚区，保证梯度连续，
+        // 避免轨迹点刚进入安全半径时 L-BFGS 出现抖动。
         if (x < 0.0) {
             return false;
         } else if (x > mu) {
@@ -54,6 +56,7 @@ struct TrajOpt::Impl {
         }
     }
     static inline double kahan_sum(double& sum, double& c, const double& val) noexcept {
+        // 障碍代价由大量采样点累加，Kahan 求和降低小残差被大代价吞掉的误差。
         double y = val - c;
         double t = sum + y;
         c = (t - sum) - y;
@@ -73,8 +76,9 @@ struct TrajOpt::Impl {
             double nearest_cost = 0.0;
             const Eigen::Vector2d& p0 = in_ps.col(i);
             const Eigen::Vector2d& p1 = in_ps.col(i + 1);
+            (void)p1;
 
-            // 1. Obstacle cost
+            // 当前实现只对控制点附加 ESDF 障碍代价，保持优化维度小且实时性更好。
             Eigen::Vector2d obs_grad = obstacle_term(p0, nearest_cost);
             kahan_sum(cost_val, c_cost, nearest_cost);
             gradp.col(i).noalias() += obs_grad;
@@ -97,6 +101,7 @@ struct TrajOpt::Impl {
         }
 
         if (d > R) {
+            // 安全半径外不施加障碍梯度，保留 MINCO 平滑项主导轨迹形状。
             return grad;
         }
 
@@ -109,6 +114,7 @@ struct TrajOpt::Impl {
         const auto w_obs = params_.obstacle_weight;
         nearest_cost = w_obs * cost_s1;
         Eigen::Vector2d dir = (g.norm() > 1e-6) ? g.normalized() : Eigen::Vector2d::Zero();
+        // ESDF 梯度指向距离增大的方向，代价对位置的梯度取反，推动控制点远离障碍。
         grad = w_obs * dcost_s1 * (-dir);
 
         if (!grad.allFinite()) {
@@ -150,6 +156,7 @@ struct TrajOpt::Impl {
         double d[4][4];
         for (int iy = 0; iy < 4; ++iy) {
             for (int ix = 0; ix < 4; ++ix) {
+                // 取 4x4 邻域用于双三次插值，比双线性插值的梯度更平滑。
                 d[iy][ix] = read(ix - 1, iy - 1);
             }
         }
@@ -161,7 +168,7 @@ struct TrajOpt::Impl {
         fy = std::clamp(fy, 0.0, 1.0);
 
         auto w = [](double t, int i) {
-            // i = 0,1,2,3  →  p_{-1}, p_0, p_1, p_2
+            // i = 0,1,2,3 对应 p_{-1}, p_0, p_1, p_2 的 Catmull-Rom 样条权重。
             double x = std::abs(t - (i - 1));
             if (x < 1.0)
                 return 1.5 * x * x * x - 2.5 * x * x + 1.0;
@@ -208,6 +215,7 @@ struct TrajOpt::Impl {
 
         double gnorm = out_grad.norm();
         if (gnorm > 1e-6) {
+            // 限制梯度模长，避免 ESDF 离散噪声在障碍边界附近产生过大的优化步。
             out_grad *= std::min(1.0, 1.0 / gnorm);
         }
         if (out_dist > R) {
@@ -275,6 +283,7 @@ struct TrajOpt::Impl {
         }
         const int opt_num = opt_indices_.size();
 
+        // 只把允许调整的中间控制点打包进优化变量；起终点和指定冻结段保持不变。
         Eigen::VectorXd x_opt(2 * opt_num);
 
         for (int k = 0; k < opt_num; ++k) {
@@ -292,6 +301,7 @@ struct TrajOpt::Impl {
         int ret = 0;
 
         if (opt_num > 0 && params_.enable) {
+            // MINCO 负责把控制点解析成五次多项式，L-BFGS 只优化控制点位置。
             ret = lbfgs::lbfgs_optimize(
                 x_opt,
                 min_cost,
@@ -313,6 +323,7 @@ struct TrajOpt::Impl {
 
         for (int k = 0; k < opt_num; ++k) {
             int i = opt_indices_[k];
+            // 将优化后的稀疏变量写回完整控制点序列，再生成最终分段轨迹。
             full_x(i) = x_opt(k);
             full_x(i + ctrl_num) = x_opt(k + opt_num);
         }
@@ -376,6 +387,8 @@ struct TrajOpt::Impl {
         instance->minco_.getEnergyPartialGradByTimes(partial_grad_by_times);
         instance->minco_.getEnergy(energy);
 
+        // MINCO 返回的是对多项式系数/时间的偏导，这里传播到控制点空间，
+        // 再叠加 ESDF 障碍代价，形成 L-BFGS 需要的统一梯度。
         instance->minco_.propogateGrad(
             partial_grad_by_coeffs,
             partial_grad_by_times,

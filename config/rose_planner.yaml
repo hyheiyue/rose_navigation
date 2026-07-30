@@ -8,6 +8,7 @@ rose_navigation_planner_node:
       default_wz: 2.14
       odometry_topic: /Odometry
       goal_topic: /rose_goal
+      goal_point_topic: /rose_goal_point
       plan_fps: 10.0
       sample_ds: 0.2
       expected_speed: 2.5

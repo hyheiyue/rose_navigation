@@ -44,6 +44,7 @@ struct state {
     state() = default;
 
     inline void plus(const Eigen::Matrix<value_type, DIM, 1>& vec) {
+        // SO(3) 状态不能直接做欧式加法，旋转相关增量通过指数映射右乘回流形。
         position += vec.segment<3>(position_index);
         rotation *= exp<value_type>(vec.segment<3>(rotation_index));
         offset_R_L_I *= exp<value_type>(vec.segment<3>(offset_R_L_I_index));
@@ -142,6 +143,7 @@ public:
         auto dt_state = static_cast<state::value_type>(timestamp - time_predict_state_last);
         if (dt_state > 0) [[likely]] {
             time_predict_state_last = timestamp;
+            // 连续时间状态用零阶保持的速度、角速度和加速度推进，适配异步点级时间戳。
             x.position += x.velocity * dt_state;
             x.rotation *= exp<state::value_type>(x.omg * dt_state);
             x.velocity += (x.rotation * x.acceleration + x.gravity) * dt_state;
@@ -165,6 +167,7 @@ public:
                 -x.rotation * hat<state::value_type>(x.acceleration);
             F.block<3, 3>(state::velocity_index, state::acceleration_index) = x.rotation * dt_cov;
             F.block<3, 3>(state::velocity_index, state::gravity_index).diagonal().fill(dt_cov);
+            // 协方差传播使用误差状态线性化矩阵 F，Q 乘 dt^2 对应离散化后的过程噪声。
             P = F * P * F.transpose() + Q * (dt_cov * dt_cov);
         }
     }
@@ -217,6 +220,8 @@ public:
         if (ldlt_b.info() != Eigen::Success) {
             return false;
         }
+        // 只对会被点云批量残差直接约束的前 K 维求解 Schur 补，剩余状态通过先验信息恢复。
+        // 这样把 30 维系统的主要求解压力压缩到较小块，适合高频 LiDAR 更新。
         const MatRK Lbb_inv_Lba = ldlt_b.solve(Lba);
         const MatK prior_schur = Laa - Lab * Lbb_inv_Lba;
         VecX iterated_dx = VecX::Zero();
@@ -236,6 +241,7 @@ public:
             VecX b = -Lambda_prior * iterated_dx;
             b.template head<K>().noalias() += batch_result.HTRz;
 
+            // 量测项只落在 a 块，b 块由先验耦合传递；这里显式构造 Schur 右端。
             const VecK b_a = b.template head<K>();
             const VecR b_b = b.template tail<Rest>();
             const VecR Lbb_inv_b_b = ldlt_b.solve(b_b);
@@ -251,10 +257,12 @@ public:
 
             for (int attempt = 0; attempt < max_lm_attempts; ++attempt) {
                 MatK schur_damped = schur;
+                // LM 阻尼让退化平面、走廊等弱约束场景下的正规方程更可解。
                 schur_damped.diagonal().noalias() += lambda * damping.diagonal();
 
                 Eigen::LDLT<MatK> ldlt_schur(schur_damped);
                 if (ldlt_schur.info() != Eigen::Success) {
+                    // 分解失败时增大阻尼，相当于从高斯牛顿逐步退回更保守的梯度下降。
                     lambda = std::min(lambda * static_cast<state::value_type>(10), lambda_max);
                     continue;
                 }
@@ -282,6 +290,7 @@ public:
             last_A12 = batch_result.HTRH;
             any_update = true;
             if (dx.norm() < convergence_eps) {
+                // 误差状态增量已经足够小，停止重线性化。
                 break;
             }
         }
@@ -301,6 +310,7 @@ public:
         } else {
             P = Lambda.inverse();
         }
+        // 数值求解后强制对称化，避免浮点误差破坏协方差矩阵的结构。
         symmetrize_and_floor(P);
 
         return any_update;

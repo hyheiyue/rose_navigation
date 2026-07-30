@@ -26,6 +26,7 @@ struct AStar::Impl {
         int idx = esdf->key_to_index(k);
         if (idx < 0)
             return false;
+        // A* 不直接使用二值占据，而是用 ESDF 与安全半径比较，把机器人半径融入搜索空间。
         return esdf->get_esdf(idx) < params_.safe_radius;
     }
     bool check_start_goal_safe(map::VoxelKey<2>& start, map::VoxelKey<2>& goal) const noexcept {
@@ -58,6 +59,7 @@ struct AStar::Impl {
             auto c = q.front();
             q.pop();
             if (!is_occupied(c)) {
+                // 起点或终点落在膨胀障碍内时，先投影到最近安全栅格，提高规划恢复能力。
                 out = c;
                 return true;
             }
@@ -89,6 +91,8 @@ struct AStar::Impl {
 
         Eigen::Vector2f last_inside = start_w;
 
+        // 目标点超出滑动 ESDF 窗口时，沿起点到目标方向找到最后一个地图内点。
+        // 这样局部规划器仍能朝全局目标前进，而不是因为目标越界直接失败。
         while (t <= len) {
             Eigen::Vector2f p = start_w + dir * t;
             auto key = esdf->world_to_key(p);
@@ -110,6 +114,7 @@ struct AStar::Impl {
         float dx = float(a.x() - b.x());
         float dy = float(a.y() - b.y());
         float dist = std::sqrt(dx * dx + dy * dy);
+        // 启发式中加入 clearance 代价，鼓励搜索远离障碍物中心线，不只是追求最短栅格距离。
         float clearance = params_.clearance_weight * (1.0f / (esdf_val + 0.1f));
         return dist + clearance;
     }
@@ -210,7 +215,7 @@ struct AStar::Impl {
             if (top.f > nodes_[cid].f + 1e-4f)
                 continue;
 
-            // goal reached
+            // 命中投影目标后回溯父节点，恢复从起点到目标的世界坐标路径。
             if (nodes_[cid].key == goal) {
                 path.clear();
 
@@ -240,6 +245,7 @@ struct AStar::Impl {
                     ? 1.0f
                     : 1.41421356f;
                 float d = esdf->get_esdf(nb_idx);
+                // 步进代价额外叠加障碍惩罚，让路径在狭窄区域自动偏向更大安全裕度。
                 float step_cost = base + params_.obstacle_penalty_weight * (1.0f / (d + 0.1f));
 
                 float ng = nodes_[cid].g + step_cost;
@@ -268,7 +274,7 @@ struct AStar::Impl {
                 }
             }
         }
-        RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "fuck");
+        RCLCPP_WARN(rclcpp::get_logger("rose_nav:planner"), "no path found");
         return SearchState::NO_PATH;
     }
     struct Node {
@@ -288,6 +294,7 @@ struct AStar::Impl {
         bool operator()(const PQItem& a, const PQItem& b) const {
             constexpr float EPS = 1e-4f;
             if (std::abs(a.f - b.f) < EPS) {
+                // f 几乎相同时优先展开启发式更小的节点，减少终点附近的无效扩展。
                 return a.h > b.h;
             }
             return a.f > b.f;

@@ -44,7 +44,8 @@
 #include <utility>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
-//ros2 service call /map_save std_srvs/srv/Trigger
+// 可用以下命令触发地图保存：
+// ros2 service call /map_save std_srvs/srv/Trigger
 namespace rose_nav::lm {
 struct SmallPointLIO::Impl {
     struct Params {
@@ -150,6 +151,9 @@ struct SmallPointLIO::Impl {
         );
         std::string lidar_topic = config.declare<std::string>("lidar_topic");
         std::string lidar_type = config.declare<std::string>("lidar_type");
+        // 这里用适配器隔离不同雷达驱动的数据格式差异，后端只消费统一的 Point/Batch。
+        // 技术难点在于 Livox、Unitree、Velodyne 的时间戳和点字段并不一致，统一入口可以
+        // 让滤波、去畸变和建图逻辑保持稳定。
         if (lidar_type == "livox_custom_msg") {
 #ifdef HAVE_LIVOX_DRIVER
             lidar_adapter = std::make_unique<LivoxCustomMsgAdapter>();
@@ -179,6 +183,7 @@ struct SmallPointLIO::Impl {
             lidar_topic,
             [this](std::vector<common::Point>& pointcloud, const rclcpp::Time& time_msg) {
                 if (!has_lidar_to_robot_transform_) {
+                    // 首帧点云到达时再查 TF，避免节点启动时静态/动态外参尚未发布导致初始化失败。
                     auto l2r_opt = tf_->get_transform<double>(
                         params_.robot_base_frame,
                         params_.lidar_frame,
@@ -198,6 +203,7 @@ struct SmallPointLIO::Impl {
                 if (!params_.robo_to_lidar_dynamic) {
                     auto lidar_to_robot_init_f = lidar_to_robot_init_.cast<float>();
                     for (auto& p: pointcloud) {
+                        // 静态外参模式下把点云预先变换到机器人基坐标系，后续滤波器无需关心雷达安装姿态。
                         p.position = lidar_to_robot_init_f * p.position;
                     }
                 }
@@ -272,6 +278,8 @@ struct SmallPointLIO::Impl {
                 small_gicp::voxelgrid_sampling_tbb(*target_cloud_, params_.algin_leaf_size);
                 small_gicp::estimate_normals_tbb(*target_cloud_, algin_near_num);
                 small_gicp::estimate_covariances_tbb(*target_cloud_, algin_near_num);
+                // 先验地图只构建一次法向、协方差和 KDTree，在线阶段只维护当前局部源点云。
+                // 这是先验重定位能够高频运行的关键：把重计算从循环中移到初始化阶段。
                 target_tree_ = std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(
                     target_cloud_,
                     small_gicp::KdTreeBuilderTBB()
@@ -293,6 +301,7 @@ struct SmallPointLIO::Impl {
                         tf_msg.header.stamp = node_->now();
                         tf_msg.header.frame_id = "map";
                         tf_msg.child_frame_id = "odom";
+                        // now_pose_in_prior_pcd_ 表示 odom 在先验 map 下的位姿，发布 TF 时需要取逆。
                         auto map_to_odom_msg = RclTF::eigen2tf(now_pose_in_prior_pcd_.inverse());
                         tf_msg.transform = map_to_odom_msg;
                         tf_->publish_transform(tf_msg);
@@ -391,6 +400,8 @@ struct SmallPointLIO::Impl {
                             imu_msg.linear_acceleration.cast<state::value_type>();
                     }
 
+                    // 静止初始化时用 IMU 加速度均值估计重力方向；取负比例是因为加速度计读数
+                    // 与世界系重力向量方向相反。这个初始化质量直接影响后续姿态收敛速度。
                     state::value_type scale =
                         -static_cast<state::value_type>(estimator_->params_.gravity.norm())
                         / estimator_->kf.x.gravity.norm();
@@ -454,6 +465,8 @@ struct SmallPointLIO::Impl {
 
         const bool use_dense = use_dense_points();
 
+        // 主处理循环按时间戳在 IMU、稀疏特征点和可选稠密点之间归并。
+        // 这种事件驱动式推进比固定帧率处理更适合非重复扫描雷达，可最大化利用点级时间信息。
         while (has_lidar() && !preprocess_.imu_deque.empty() && has_dense()) {
             const double imu_ts = preprocess_.imu_deque.front().timestamp;
             const double lidar_ts = lidar_timestamp();
@@ -480,6 +493,7 @@ struct SmallPointLIO::Impl {
                     (estimator_->kf.x.rotation * dense_point_imu_frame + estimator_->kf.x.position)
                         .cast<float>()
                 );
+                // 稠密点只用于发布/保存注册点云，不参与滤波更新，避免计算量随原始点数爆炸。
                 preprocess_.dense_point_deque.pop_front();
                 continue;
             }
@@ -496,12 +510,11 @@ struct SmallPointLIO::Impl {
                     time_current = batch_frame.timestamp;
                     estimator_->kf.predict_state(time_current);
                     estimator_->current_batch = batch_frame;
+                    // 批量更新把一帧内的点到平面残差汇总成正规方程，降低逐点 ESKF 更新开销。
                     estimator_->kf.update_iterated_batch();
-                    // if (!estimator_->params_.use_priori_pcd) {
                     for (const auto& point: estimator_->points_odom_frame) {
                         estimator_->ivox->add_point(point);
                     }
-                    // }
 
                     log_ctx_.processed_points += estimator_->points_odom_frame.size();
                     preprocess_.point_batch_deque.pop_front();
@@ -517,9 +530,9 @@ struct SmallPointLIO::Impl {
                     estimator_->kf.predict_state(time_current);
                     estimator_->point_lidar_frame = point_lidar_frame.position;
                     bool has_matched = estimator_->kf.update_point();
-                    // if (!estimator_->params_.use_priori_pcd) {
+                    (void)has_matched;
+                    // 单点模式每处理一个有效点就写入 iVox，使局部地图保持实时增量更新。
                     estimator_->ivox->add_point(estimator_->point_odom_frame);
-                    // }
 
                     log_ctx_.processed_points++;
                     preprocess_.point_deque.pop_front();
@@ -535,6 +548,7 @@ struct SmallPointLIO::Impl {
 
                 time_current = imu_msg.timestamp;
 
+                // IMU 先做状态和协方差预测，再用当前 IMU 量测约束角速度/加速度及 bias。
                 estimator_->kf.predict_state(time_current);
                 estimator_->kf.predict_cov(time_current, Q);
 

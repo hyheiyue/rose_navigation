@@ -27,6 +27,8 @@ Estimator::Estimator(const ParamsNode& config) {
         [this](auto&& s, auto&& measurement_result) { return h_imu(s, measurement_result); },
         [this](auto&& s, auto&& measurement_result) { return h_batch(s, measurement_result); }
     );
+    // ESKF 本体不直接依赖地图或传感器格式，三个量测模型以回调注入，便于在逐点更新、
+    // 批量更新和 IMU 约束之间复用同一套预测/更新框架。
     kf.max_iter = params_.max_iter;
     reset();
 }
@@ -126,6 +128,7 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
     const auto kf_pos = s.position;
     const auto kf_vel = s.velocity;
     const Eigen::Vector3d w = s.omg;
+    // 每个线程独立持有特征分解器和正规方程缓存，避免并行 PCA 时反复分配对象或抢锁。
     tbb::enumerable_thread_specific<Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>> local_solver(
         [] { return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(); }
     );
@@ -219,6 +222,7 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
 
                 BatchPlaneCache::accessor inserted_plane;
                 if (batch_plane_cache_.insert(inserted_plane, voxel_idx)) {
+                    // 同一批次内落在同一体素的点复用平面模型，减少近邻搜索和 PCA 次数。
                     inserted_plane->second.normal = n;
                     inserted_plane->second.plane_d = d_plane;
                 } else {
@@ -269,6 +273,8 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
             // const state::value_type weight =
             //     invR * static_cast<state::value_type>(current_batch.points[i].count);
             const state::value_type weight = invR;
+            // 直接累加 H^T R^-1 H 和 H^T R^-1 z，避免保存每个点的 Jacobian。
+            // 这相当于把大规模点云量测压缩成固定维度正规方程，是批量更新的核心优化。
             local_result.HTRH.noalias() += H.transpose() * (H * weight);
             local_result.HTRz.noalias() += H.transpose() * (weight * -d_signed);
             ++local_result.effective_count;
@@ -299,6 +305,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
         return;
     }
     // 对近邻点做 PCA 平面拟合，后续使用点到平面的距离作为滤波器量测。
+    // 相比点到点残差，点到平面残差对低线数/非重复扫描 LiDAR 更稳定，收敛也更快。
 
     Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
     for (const auto& p: nearest_points) {
@@ -334,6 +341,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
         A.noalias() = point_imu_frame.cross(C);
         B.noalias() =
             point_lidar_frame.cast<state::value_type>().cross(s.offset_R_L_I.transpose() * C);
+        // 外参在线估计时，H 同时包含车体位姿和 LiDAR-IMU 外参的扰动项。
         measurement_result.H << normal0.transpose(), A.transpose(), B.transpose(), C.transpose();
     } else {
         Eigen::Matrix<state::value_type, 3, 1> normal0 = normal.cast<state::value_type>();

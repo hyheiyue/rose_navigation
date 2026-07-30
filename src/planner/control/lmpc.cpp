@@ -162,6 +162,8 @@ struct LMPC::Impl {
         const auto R = params_.R_omni;
         const auto Rd = params_.Rd_omni;
 
+        // 全向底盘模型是线性的，MPC 可以直接写成稀疏 QP：
+        // 变量包含预测位置和速度指令，目标函数同时跟踪位置、前馈速度并惩罚速度突变。
         /* ---------------- 目标函数一阶项 ---------------- */
 
         for (int i = 0; i < steps; ++i) {
@@ -366,6 +368,7 @@ struct LMPC::Impl {
             omni_.solver.data()->setNumberOfVariables(nx);
             omni_.solver.data()->setNumberOfConstraints(nc);
 
+            // QP 的稀疏结构只与预测步数有关，初始化后复用求解器内存和符号分解结果。
             omni_.solver.data()->setLinearConstraintsMatrix(omni_.A_cache);
             omni_.solver.data()->setHessianMatrix(omni_.qp_hessian);
             omni_.solver.data()->setGradient(omni_.qp_gradient);
@@ -442,6 +445,7 @@ struct LMPC::Impl {
 
             predict_motion();
             omni_.last_output = omni_.output;
+            // 以最新滚动预测作为线性化参考，反复求解直到控制周期预算耗尽或控制量收敛。
             solve_mpc_omni();
         }
         ControlOutput o;

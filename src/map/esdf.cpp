@@ -36,6 +36,7 @@ ESDF::ESDF(BinMap::Ptr bin, const ParamsNode& config) {
     step_cost_[1] = vs * std::sqrt(2.0f); // 对角相邻代价
 }
 void ESDF::update() {
+    // ESDF 由最新二值占据图完整重建，保证规划查询时读到的是一致的有符号距离场。
     rebuild_signed();
 }
 std::vector<Eigen::Vector4f> ESDF::get_occupied_points(int step) const {
@@ -63,10 +64,12 @@ void ESDF::propagate_key_distance_field_two_pass(
 
     tbb::parallel_for(0, size, [&](int i) {
         const bool is_occ = (acc[i] != 0);
+        // 目标类型格子作为距离源，其余格子初始化为无穷大等待扫描松弛。
         dist[i] = (is_occ == source_is_occ) ? 0.0f : kInf;
     });
 
     if (std::none_of(dist.begin(), dist.end(), [](float v) { return v == 0.0f; })) {
+        // 没有源点时距离场无定义，保持无穷大，避免后续误认为有安全距离。
         std::fill(dist.begin(), dist.end(), kInf);
         return;
     }
@@ -153,7 +156,8 @@ void ESDF::rebuild_signed() {
         tbb::blocked_range<int>(0, esdf_->grid_size()),
         [&](const tbb::blocked_range<int>& r) {
             for (int i = r.begin(); i != r.end(); ++i) {
-                // 正值表示在障碍物外部，负值表示在占据空间内部。
+                // 有符号距离 = 到障碍距离 - 到空闲距离：
+                // 正值表示障碍外部，负值表示占据内部，零附近就是障碍边界。
                 esdf_->grid[i] = dist_to_occ_[i] - dist_to_free_[i];
             }
         }
