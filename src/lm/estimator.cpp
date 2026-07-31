@@ -11,7 +11,7 @@
 #include <cmath>
 #include <tbb/tbb.h>
 namespace rose_nav::lm {
-constexpr int NUM_MATCH_POINTS = 1000;
+constexpr int NUM_MATCH_POINTS = 5;
 constexpr int MIN_MATCH_POINTS = 5;
 Estimator::Estimator(const ParamsNode& config) {
     params_.load(config);
@@ -96,203 +96,219 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
         batch_plane_cache_.clear();
     }
 
+    using Scalar = state::value_type;
+
     const bool ext_on = params_.extrinsic_est_en;
 
-    const Eigen::Matrix3d R_LI = ext_on ? s.offset_R_L_I : Lidar_R_wrt_IMU.cast<double>();
-    const Eigen::Vector3d T_LI = ext_on ? s.offset_T_L_I : Lidar_T_wrt_IMU.cast<double>();
+    const Eigen::Matrix<Scalar, 3, 3> R_LI = ext_on ? s.offset_R_L_I : Lidar_R_wrt_IMU;
+    const Eigen::Matrix<Scalar, 3, 1> T_LI = ext_on ? s.offset_T_L_I : Lidar_T_wrt_IMU;
 
     const double plane_thr = params_.plane_threshold;
     const double match_s = params_.match_sqaured;
     const double laser_cov = params_.laser_point_cov;
 
-    const auto kf_rot = s.rotation;
-    const auto kf_pos = s.position;
-    const auto kf_vel = s.velocity;
-    const Eigen::Vector3d w = s.omg;
-    // 每个线程独立持有特征分解器和正规方程缓存，避免并行 PCA 时反复分配对象或抢锁。
-    tbb::enumerable_thread_specific<Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>> local_solver(
-        [] { return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(); }
-    );
-    tbb::enumerable_thread_specific<batch_measurement_result> local_results([] {
-        return batch_measurement_result {};
-    });
-    tbb::enumerable_thread_specific<std::vector<Eigen::Vector3f>> local_near_points([] {
-        std::vector<Eigen::Vector3f> near;
-        near.reserve(5);
-        return near;
-    });
-    // std::cout<<N<<std::endl;
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, N,8), [&](const tbb::blocked_range<size_t>& r) {
-        auto& solver = local_solver.local();
-        auto& local_result = local_results.local();
-        auto& near = local_near_points.local();
+    const Eigen::Matrix<Scalar, 3, 3> kf_rot = s.rotation;
+    const Eigen::Matrix<Scalar, 3, 1> kf_pos = s.position;
+    const Eigen::Matrix<Scalar, 3, 1> kf_vel = s.velocity;
+    const Eigen::Matrix<Scalar, 3, 1> w = s.omg;
 
-        for (size_t i = r.begin(); i != r.end(); ++i) {
-            const auto& p = current_batch.points[i];
-            if (p.count < 1) {
-                continue;
-            }
-            const double dt = p.timestamp - current_batch.timestamp;
-            const Eigen::Vector3d pt_imu_d = R_LI * p.position.cast<double>() + T_LI;
-
-            Eigen::Matrix3d R_delta = Eigen::Matrix3d::Identity();
-
-            R_delta = exp<double>(w * dt);
-
-            // 先用匀速模型将每个点去畸变到当前批次时间，再搜索局部地图平面。
-            const Eigen::Vector3d pt_imu_deskew = R_delta * pt_imu_d;
-            const Eigen::Vector3d pt_odom_d = kf_rot * pt_imu_deskew + kf_pos + kf_vel * dt;
-
-            points_odom_frame[i] = pt_odom_d.cast<float>();
-            const SmallOctVox::PositionIndex voxel_idx =
-                ivox->get_position_index(points_odom_frame[i]);
-
-            Eigen::Vector3d n;
-            double d_plane = 0.0;
-
-            PlaneCache::const_accessor cached_plane;
-            if (batch_plane_cache_.find(cached_plane, voxel_idx)) {
-                if (!cached_plane->second.valid) {
-                    continue;
-                }
-                n = cached_plane->second.normal;
-                d_plane = cached_plane->second.plane_d;
-            } else {
-                cached_plane.release();
-
-                near.clear();
-                ivox->get_closest_point(points_odom_frame[i], near, NUM_MATCH_POINTS);
-                if (near.size() < MIN_MATCH_POINTS) {
-                    cache_plane(batch_plane_cache_, voxel_idx, Eigen::Vector3d::Zero(), 0.0, false);
-                    continue;
-                }
-
-                Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
-                for (const auto& np: near) {
-                    centroid += np.cast<double>();
-                }
-                centroid /= static_cast<double>(near.size());
-
-                Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-                for (const auto& np: near) {
-                    const Eigen::Vector3d d = np.cast<double>() - centroid;
-                    cov.noalias() += d * d.transpose();
-                }
-
-                if (near.size() <= 1) {
-                    continue;
-                }
-                cov /= static_cast<double>(near.size() - 1);
-
-                // 邻域协方差矩阵的最小特征向量即拟合平面的法向量。
-                solver.compute(cov);
-                n = solver.eigenvectors().col(0);
-                d_plane = -n.dot(centroid);
-
-                if (s.batch_iter == 0) {
-                    const double pt_norm = current_batch.points[i].position.norm();
-
-                    // 首轮迭代先过滤弱匹配；后续迭代基于更精确的状态，
-                    // 可以更直接地使用残差。
-                    const double d_signed_first = n.dot(pt_odom_d) + d_plane;
-                    if (pt_norm <= match_s * d_signed_first * d_signed_first) {
-                        continue;
-                    }
-
-                    bool valid = true;
-                    for (const auto& np: near) {
-                        if (std::abs(n.dot(np.cast<double>()) + d_plane) > plane_thr) {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    if (!valid) {
-                        cache_plane(
-                            batch_plane_cache_,
-                            voxel_idx,
-                            Eigen::Vector3d::Zero(),
-                            0.0,
-                            false
-                        );
-                        continue;
-                    }
-                }
-
-                // 同一批次内落在同一体素的点复用平面模型，减少近邻搜索和 PCA 次数。
-                cache_plane(batch_plane_cache_, voxel_idx, n, d_plane, true);
-            }
-
-            const double d_signed = n.dot(pt_odom_d) + d_plane;
-
-            const Eigen::Matrix<state::value_type, 3, 1> normal0 = n.cast<state::value_type>();
-            Eigen::Matrix<state::value_type, 1, batch_measurement_result::DIM> H;
-            H.setZero();
-            const Eigen::Matrix<state::value_type, 3, 1> velocity_jac =
-                normal0 * static_cast<state::value_type>(dt);
-
-            if (ext_on) {
-                // 开启外参估计时，在点到平面 Jacobian 的位姿项后追加
-                // LiDAR-IMU 旋转和平移外参的导数。
-                const Eigen::Matrix<state::value_type, 3, 1> C = s.rotation.transpose() * normal0;
-                const Eigen::Matrix<state::value_type, 3, 1> C_deskew =
-                    R_delta.cast<state::value_type>().transpose() * C;
-
-                const Eigen::Matrix<state::value_type, 3, 1> A =
-                    pt_imu_deskew.cast<state::value_type>().cross(C);
-
-                const Eigen::Matrix<state::value_type, 3, 1> B =
-                    p.position.cast<state::value_type>().cross(
-                        s.offset_R_L_I.transpose() * C_deskew
-                    );
-
-                H.template segment<3>(state::position_index) = normal0.transpose();
-                H.template segment<3>(state::rotation_index) = A.transpose();
-                H.template segment<3>(state::offset_R_L_I_index) = B.transpose();
-                H.template segment<3>(state::offset_T_L_I_index) = C_deskew.transpose();
-            } else {
-                const Eigen::Matrix<state::value_type, 3, 1> A =
-                    pt_imu_deskew.cast<state::value_type>().cross(s.rotation.transpose() * normal0);
-
-                H.template segment<3>(state::position_index) = normal0.transpose();
-                H.template segment<3>(state::rotation_index) = A.transpose();
-            }
-            H.template segment<3>(state::velocity_index) = velocity_jac.transpose();
-
-            const state::value_type invR = static_cast<state::value_type>(1)
-                / std::max(static_cast<state::value_type>(laser_cov),
-                           static_cast<state::value_type>(1e-9));
-            // const state::value_type weight =
-            //     invR * static_cast<state::value_type>(current_batch.points[i].count);
-            const state::value_type weight = invR;
-            // 直接累加 H^T R^-1 H 和 H^T R^-1 z，避免保存每个点的 Jacobian。
-            // 这相当于把大规模点云量测压缩成固定维度正规方程，是批量更新的核心优化。
-            local_result.HTRH.noalias() += H.transpose() * (H * weight);
-            local_result.HTRz.noalias() += H.transpose() * (weight * -d_signed);
-            ++local_result.effective_count;
+    auto process_point = [&](size_t i,
+                             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>& solver,
+                             batch_measurement_result& measurement,
+                             std::vector<Eigen::Vector3f>& near) {
+        const auto& p = current_batch.points[i];
+        if (p.count < 1) {
+            return;
         }
-    });
+        const double dt = p.timestamp - current_batch.timestamp;
+        const Scalar dt_state = static_cast<Scalar>(dt);
+        const Eigen::Matrix<Scalar, 3, 1> pt_imu = R_LI * p.position.cast<Scalar>() + T_LI;
 
-    for (const auto& local_result: local_results) {
-        result.HTRH.noalias() += local_result.HTRH;
-        result.HTRz.noalias() += local_result.HTRz;
-        result.effective_count += local_result.effective_count;
+        Eigen::Matrix<Scalar, 3, 3> R_delta = Eigen::Matrix<Scalar, 3, 3>::Identity();
+
+        R_delta = exp<Scalar>(w * dt_state);
+
+        // 先用匀速模型将每个点去畸变到当前批次时间，再搜索局部地图平面。
+        const Eigen::Matrix<Scalar, 3, 1> pt_imu_deskew = R_delta * pt_imu;
+        const Eigen::Matrix<Scalar, 3, 1> pt_odom =
+            kf_rot * pt_imu_deskew + kf_pos + kf_vel * dt_state;
+        const Eigen::Vector3d pt_odom_d = pt_odom.template cast<double>();
+
+        points_odom_frame[i] = pt_odom_d.cast<float>();
+        const SmallOctVox::PositionIndex voxel_idx = ivox->get_position_index(points_odom_frame[i]);
+
+        Eigen::Vector3d n;
+        double d_plane = 0.0;
+
+        PlaneCache::const_accessor cached_plane;
+        // 可以缓存的前提是在本次更新结束才会将更新后的点加入ivox，也就是更新过程中ivox完全不变
+        if (batch_plane_cache_.find(cached_plane, voxel_idx)) {
+            if (!cached_plane->second.valid) {
+                return;
+            }
+            n = cached_plane->second.normal;
+            d_plane = cached_plane->second.plane_d;
+        } else {
+            cached_plane.release();
+
+            near.clear();
+            ivox->get_closest_point(points_odom_frame[i], near, NUM_MATCH_POINTS);
+            if (near.size() < MIN_MATCH_POINTS) {
+                cache_plane(batch_plane_cache_, voxel_idx, Eigen::Vector3d::Zero(), 0.0, false);
+                return;
+            }
+
+            Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+            for (const auto& np: near) {
+                centroid += np.cast<double>();
+            }
+            centroid /= static_cast<double>(near.size());
+
+            Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+            for (const auto& np: near) {
+                const Eigen::Vector3d d = np.cast<double>() - centroid;
+                cov.noalias() += d * d.transpose();
+            }
+
+            if (near.size() <= 1) {
+                return;
+            }
+            cov /= static_cast<double>(near.size() - 1);
+
+            // 邻域协方差矩阵的最小特征向量即拟合平面的法向量。
+            solver.compute(cov);
+            n = solver.eigenvectors().col(0);
+            d_plane = -n.dot(centroid);
+
+            if (s.batch_iter == 0) {
+                const double pt_norm = current_batch.points[i].position.norm();
+
+                // 首轮迭代先过滤弱匹配；后续迭代基于更精确的状态，
+                // 可以更直接地使用残差。
+                const double d_signed_first = n.dot(pt_odom_d) + d_plane;
+                if (pt_norm <= match_s * d_signed_first * d_signed_first) {
+                    return;
+                }
+
+                bool valid = true;
+                for (const auto& np: near) {
+                    if (std::abs(n.dot(np.cast<double>()) + d_plane) > plane_thr) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) {
+                    cache_plane(batch_plane_cache_, voxel_idx, Eigen::Vector3d::Zero(), 0.0, false);
+                    return;
+                }
+            }
+
+            // 同一批次内落在同一体素的点复用平面模型，减少近邻搜索和 PCA 次数。
+            cache_plane(batch_plane_cache_, voxel_idx, n, d_plane, true);
+        }
+
+        const double d_signed = n.dot(pt_odom_d) + d_plane;
+
+        const Eigen::Matrix<Scalar, 3, 1> normal0 = n.cast<Scalar>();
+        Eigen::Matrix<Scalar, 1, batch_measurement_result::DIM> H;
+        H.setZero();
+        const Eigen::Matrix<Scalar, 3, 1> velocity_jac = normal0 * dt_state;
+
+        if (ext_on) {
+            // 开启外参估计时，在点到平面 Jacobian 的位姿项后追加
+            // LiDAR-IMU 旋转和平移外参的导数。
+            const Eigen::Matrix<Scalar, 3, 1> C = s.rotation.transpose() * normal0;
+            const Eigen::Matrix<Scalar, 3, 1> C_deskew = R_delta.transpose() * C;
+
+            const Eigen::Matrix<Scalar, 3, 1> A = pt_imu_deskew.cross(C);
+
+            const Eigen::Matrix<Scalar, 3, 1> B =
+                p.position.cast<Scalar>().cross(s.offset_R_L_I.transpose() * C_deskew);
+
+            H.template segment<3>(state::position_index) = normal0.transpose();
+            H.template segment<3>(state::rotation_index) = A.transpose();
+            H.template segment<3>(state::offset_R_L_I_index) = B.transpose();
+            H.template segment<3>(state::offset_T_L_I_index) = C_deskew.transpose();
+        } else {
+            const Eigen::Matrix<Scalar, 3, 1> A =
+                pt_imu_deskew.cross(s.rotation.transpose() * normal0);
+
+            H.template segment<3>(state::position_index) = normal0.transpose();
+            H.template segment<3>(state::rotation_index) = A.transpose();
+        }
+        H.template segment<3>(state::velocity_index) = velocity_jac.transpose();
+
+        const state::value_type invR = static_cast<state::value_type>(1)
+            / std::max(static_cast<state::value_type>(laser_cov),
+                       static_cast<state::value_type>(1e-9));
+        const state::value_type weight =
+            invR * static_cast<state::value_type>(current_batch.points[i].count);
+        // const state::value_type weight = invR;
+        // 直接累加 H^T R^-1 H 和 H^T R^-1 z，避免保存每个点的 Jacobian。
+        // 这相当于把大规模点云量测压缩成固定维度正规方程，是批量更新的核心优化。
+        measurement.HTRH.noalias() += H.transpose() * (H * weight);
+        measurement.HTRz.noalias() += H.transpose() * (weight * -d_signed);
+        ++measurement.effective_count;
+    };
+
+    if (params_.h_batch_parallel) {
+        // 每个线程独立持有特征分解器和正规方程缓存，避免并行 PCA 时反复分配对象或抢锁。
+        tbb::enumerable_thread_specific<Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>>
+            local_solver([] { return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(); });
+        tbb::enumerable_thread_specific<batch_measurement_result> local_results([] {
+            return batch_measurement_result {};
+        });
+        tbb::enumerable_thread_specific<std::vector<Eigen::Vector3f>> local_near_points([] {
+            std::vector<Eigen::Vector3f> near;
+            near.reserve(NUM_MATCH_POINTS);
+            return near;
+        });
+
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, N),
+            [&](const tbb::blocked_range<size_t>& r) {
+                auto& solver = local_solver.local();
+                auto& local_result = local_results.local();
+                auto& near = local_near_points.local();
+
+                for (size_t i = r.begin(); i != r.end(); ++i) {
+                    process_point(i, solver, local_result, near);
+                }
+            }
+        );
+
+        for (const auto& local_result: local_results) {
+            result.HTRH.noalias() += local_result.HTRH;
+            result.HTRz.noalias() += local_result.HTRz;
+            result.effective_count += local_result.effective_count;
+        }
+    } else {
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver;
+        std::vector<Eigen::Vector3f> near;
+        near.reserve(NUM_MATCH_POINTS);
+
+        for (size_t i = 0; i < N; ++i) {
+            process_point(i, solver, result, near);
+        }
     }
 }
 
 void Estimator::h_point(const state& s, point_measurement_result& measurement_result) {
+    using Scalar = state::value_type;
+
     measurement_result.valid = false;
     // 将当前 LiDAR 点转换到 IMU 再到里程计坐标系，用于在局部 iVox 地图中找邻域点。
-    Eigen::Matrix<state::value_type, 3, 1> point_imu_frame;
+    Eigen::Matrix<Scalar, 3, 1> point_imu_frame;
     if (params_.extrinsic_est_en) {
-        point_imu_frame =
-            s.offset_R_L_I * point_lidar_frame.cast<state::value_type>() + s.offset_T_L_I;
+        point_imu_frame = s.offset_R_L_I * point_lidar_frame.cast<Scalar>() + s.offset_T_L_I;
     } else {
-        point_imu_frame =
-            Lidar_R_wrt_IMU * point_lidar_frame.cast<state::value_type>() + Lidar_T_wrt_IMU;
+        point_imu_frame = Lidar_R_wrt_IMU * point_lidar_frame.cast<Scalar>() + Lidar_T_wrt_IMU;
     }
-    point_odom_frame = (s.rotation * point_imu_frame + s.position).cast<float>();
+    const Eigen::Matrix<Scalar, 3, 1> point_odom = s.rotation * point_imu_frame + s.position;
+    point_odom_frame = point_odom.template cast<float>();
     // 单点模式以当前状态预测后的 odom 体素为缓存键；如果该体素已经拟合过稳定平面，
     // 后续点或迭代重线性化可直接复用，避免重复近邻搜索和 PCA。
+    // 可以缓存的前提是在本次更新结束才会将更新后的点加入ivox，也就是更新过程中ivox完全不变
     const SmallOctVox::PositionIndex voxel_idx = ivox->get_position_index(point_odom_frame);
     Eigen::Vector3d normal_d;
     double plane_d = 0.0;
@@ -307,8 +323,8 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
         plane_d = cached_plane->second.plane_d;
         const double cached_dist = normal_d.dot(point_odom_frame.cast<double>()) + plane_d;
         // 缓存平面必须仍能解释当前点；残差过大说明状态变化或地图更新后平面已不适用。
-        can_reuse_plane = std::isfinite(cached_dist)
-            && std::abs(cached_dist) <= params_.plane_threshold;
+        can_reuse_plane =
+            std::isfinite(cached_dist) && std::abs(cached_dist) <= params_.plane_threshold;
         cached_plane.release();
     }
 
@@ -353,23 +369,24 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
         return;
     }
     // 计算点到平面残差及其对状态量的 Jacobian。
-    measurement_result.laser_point_cov = static_cast<state::value_type>(params_.laser_point_cov);
+    measurement_result.laser_point_cov = static_cast<Scalar>(params_.laser_point_cov);
     if (params_.extrinsic_est_en) {
-        Eigen::Matrix<state::value_type, 3, 1> normal0 = normal_d.cast<state::value_type>();
-        Eigen::Matrix<state::value_type, 3, 1> C = s.rotation.transpose() * normal0;
-        Eigen::Matrix<state::value_type, 3, 1> A, B;
+        Eigen::Matrix<Scalar, 3, 1> normal0 = normal_d.cast<Scalar>();
+        Eigen::Matrix<Scalar, 3, 1> C = s.rotation.transpose() * normal0;
+        Eigen::Matrix<Scalar, 3, 1> A, B;
         A.noalias() = point_imu_frame.cross(C);
-        B.noalias() =
-            point_lidar_frame.cast<state::value_type>().cross(s.offset_R_L_I.transpose() * C);
+        B.noalias() = point_lidar_frame.cast<Scalar>().cross(s.offset_R_L_I.transpose() * C);
         // 外参在线估计时，H 同时包含车体位姿和 LiDAR-IMU 外参的扰动项。
         measurement_result.H << normal0.transpose(), A.transpose(), B.transpose(), C.transpose();
     } else {
-        Eigen::Matrix<state::value_type, 3, 1> normal0 = normal_d.cast<state::value_type>();
-        Eigen::Matrix<state::value_type, 3, 1> A;
+        Eigen::Matrix<Scalar, 3, 1> normal0 = normal_d.cast<Scalar>();
+        Eigen::Matrix<Scalar, 3, 1> A;
         A.noalias() = point_imu_frame.cross(s.rotation.transpose() * normal0);
-        measurement_result.H << normal0.transpose(), A.transpose(), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+        measurement_result.H << normal0.transpose(), A.transpose(), static_cast<Scalar>(0.0),
+            static_cast<Scalar>(0.0), static_cast<Scalar>(0.0), static_cast<Scalar>(0.0),
+            static_cast<Scalar>(0.0), static_cast<Scalar>(0.0);
     }
-    measurement_result.z = -static_cast<state::value_type>(point_distanace);
+    measurement_result.z = -static_cast<Scalar>(point_distanace);
     measurement_result.valid = true;
 }
 
