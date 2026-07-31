@@ -346,11 +346,11 @@ private:
             | (static_cast<uint64_t>(key.y) & mask) << 21 | (static_cast<uint64_t>(key.z) & mask);
     }
 
-    float resolution_ = 0.5f;
-    float inv_resolution_ = 2.0f;
-    float sub_resolution_ = 0.25f;
-    float sub_inv_resolution_ = 4.0f;
-    size_t capacity_ = 1000000;
+    float resolution_ ;
+    float inv_resolution_ ;
+    float sub_resolution_ ;
+    float sub_inv_resolution_ ;
+    size_t capacity_ ;
     std::array<float, 6> group_min_dist2_ {};
 
     VoxelList voxels_;

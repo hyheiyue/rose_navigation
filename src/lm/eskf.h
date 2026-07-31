@@ -172,7 +172,7 @@ public:
         }
     }
 
-    inline bool update_point() {
+    inline bool update_iterated_point() {
         constexpr state::value_type convergence_eps = static_cast<state::value_type>(1e-4);
         const int iter_num = max_iter > 0 ? max_iter : 1;
         const Eigen::Matrix<state::value_type, state::DIM, state::DIM> P_prior = P;

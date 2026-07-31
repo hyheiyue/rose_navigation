@@ -12,12 +12,10 @@
 #include "small_ivox.h"
 #include "utils/rclcpp_parameter_node.hpp"
 #include <Eigen/src/Core/Matrix.h>
-#include <Eigen/src/Geometry/Transform.h>
 #include <tbb/concurrent_hash_map.h>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
-#include <string>
 #include <vector>
 namespace rose_nav::lm {
 
@@ -48,9 +46,6 @@ public:
         Eigen::Vector3d gravity;
         int init_map_size = 10;
         bool fix_gravity_direction = true;
-        bool use_priori_pcd_add_ivox = false;
-        std::string prior_pcd_path;
-        Eigen::Isometry3d init_pose_in_prior_pcd;
         void load(const ParamsNode& config) {
             max_iter = config.declare<int>("max_iter");
             map_resolution = config.declare<double>("map_resolution");
@@ -80,25 +75,6 @@ public:
                 extrinsic_R_vec[7], extrinsic_R_vec[8];
             auto gravity_vec = config.declare<std::vector<double>>("gravity");
             gravity = Eigen::Vector3d(gravity_vec[0], gravity_vec[1], gravity_vec[2]);
-            use_priori_pcd_add_ivox = config.declare<bool>("use_priori_pcd_add_ivox");
-            prior_pcd_path = config.declare<std::string>("prior_pcd_path");
-            auto init_pose_in_prior_pcd_config = config.sub("init_pose_in_prior_pcd");
-            init_pose_in_prior_pcd = Eigen::Isometry3d::Identity();
-            auto init_pose_in_prior_pcd_t_vec =
-                init_pose_in_prior_pcd_config.declare<std::vector<double>>("translation");
-            init_pose_in_prior_pcd.translation() = Eigen::Vector3d(
-                init_pose_in_prior_pcd_t_vec[0],
-                init_pose_in_prior_pcd_t_vec[1],
-                init_pose_in_prior_pcd_t_vec[2]
-            );
-            auto init_pose_in_prior_pcd_r_vec =
-                init_pose_in_prior_pcd_config.declare<std::vector<double>>("rotation");
-
-            init_pose_in_prior_pcd.linear() << init_pose_in_prior_pcd_r_vec[0],
-                init_pose_in_prior_pcd_r_vec[1], init_pose_in_prior_pcd_r_vec[2],
-                init_pose_in_prior_pcd_r_vec[3], init_pose_in_prior_pcd_r_vec[4],
-                init_pose_in_prior_pcd_r_vec[5], init_pose_in_prior_pcd_r_vec[6],
-                init_pose_in_prior_pcd_r_vec[7], init_pose_in_prior_pcd_r_vec[8];
         }
     } params_;
     Estimator(const ParamsNode& config);

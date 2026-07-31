@@ -11,18 +11,6 @@ rose_navigation_lm_node:
       batch_update: true
       robo_to_lidar_dynamic: false
       save_pcd: false   # 是否保存点云
-      use_priori_pcd_add_ivox: false
-      use_priori_pcd_for_algin: false
-      prior_pcd_path: /home/hy/rose_nav/src/rose_navigation/pcd/sim.pcd
-      init_pose_in_prior_pcd:
-        translation: [1.0,1.0,0.0]
-        rotation: [1.0, 0.0, 0.0,
-                        0.0, 1.0, 0.0,
-                        0.0, 0.0, 1.0]
-      algin_fps: 1.0
-      algin_max_sq: 4.0
-      algin_leaf_size: 0.1
-      algin_max_iter: 10
       min_distance: 0.5                          # 点云半径最小值，小于该值会被过滤
       max_distance: 1000.0                       # 点云半径最大值，大于该值会被过滤
       point_filter_num: 1
@@ -61,4 +49,3 @@ rose_navigation_lm_node:
       bg_cov: 0.0001                             # 角速度偏置的协方差
       plane_threshold: 0.1                       # 平面匹配阈值，越小表示越严格
       match_sqaured: 81.0                        # 当前点是否在平面上的阈值，越小表示越严格          
-

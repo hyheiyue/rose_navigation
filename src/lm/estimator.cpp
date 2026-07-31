@@ -8,7 +8,6 @@
 #include "lm/eskf.h"
 #include "lm/small_ivox.h"
 #include "lm/small_oct_vox.hpp"
-#include "utils/io/pcd_io.h"
 #include <cmath>
 #include <tbb/tbb.h>
 namespace rose_nav::lm {
@@ -38,43 +37,6 @@ void Estimator::reset() {
     ivox = std::make_shared<SmallOctVox>(params_.map_resolution, 1000000);
     batch_plane_cache_.clear();
     point_plane_cache_.clear();
-    if (params_.use_priori_pcd_add_ivox) {
-        std::vector<Eigen::Vector3f> pointcloud;
-        if (io::pcd::read_pcd(params_.prior_pcd_path, pointcloud)) {
-            RCLCPP_INFO(
-                rclcpp::get_logger("rose_nav::lm"),
-                "pcd: %s loaded",
-                params_.prior_pcd_path.c_str()
-            );
-            tbb::parallel_sort(
-                pointcloud.begin(),
-                pointcloud.end(),
-                [&](const auto& a, const auto& b) {
-                    // 先插入离初始位姿更远的点，减少局部区域过密时对 iVox 桶的早期占用。
-                    return (a - params_.init_pose_in_prior_pcd.translation().cast<float>())
-                               .squaredNorm()
-                        > (b - params_.init_pose_in_prior_pcd.translation().cast<float>())
-                              .squaredNorm();
-                }
-            );
-            for (const auto& p: pointcloud) {
-                (void)ivox->add_point(p);
-            }
-            RCLCPP_INFO(
-                rclcpp::get_logger("rose_nav::lm"),
-                "ivox add %d points",
-                static_cast<int>(pointcloud.size())
-            );
-            kf.x.position = params_.init_pose_in_prior_pcd.translation().cast<state::value_type>();
-            kf.x.rotation = params_.init_pose_in_prior_pcd.linear().cast<state::value_type>();
-        } else {
-            RCLCPP_ERROR(
-                rclcpp::get_logger("rose_nav::lm"),
-                "Failed to load pcd: %s",
-                params_.prior_pcd_path.c_str()
-            );
-        }
-    }
     kf.x.reset();
     // 初始协方差保守设置：姿态/位置较小，IMU bias 与重力方向允许后续量测继续修正。
     kf.P = Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Identity() * 0.01;
@@ -156,11 +118,11 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
     });
     tbb::enumerable_thread_specific<std::vector<Eigen::Vector3f>> local_near_points([] {
         std::vector<Eigen::Vector3f> near;
-        near.reserve(NUM_MATCH_POINTS);
+        near.reserve(5);
         return near;
     });
-
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, N), [&](const tbb::blocked_range<size_t>& r) {
+    // std::cout<<N<<std::endl;
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, N,8), [&](const tbb::blocked_range<size_t>& r) {
         auto& solver = local_solver.local();
         auto& local_result = local_results.local();
         auto& near = local_near_points.local();
