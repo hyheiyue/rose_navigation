@@ -28,7 +28,7 @@ rose_navigation_lm_node:
       # 地图
       map_resolution: 0.1                    # 地图分辨率
       init_map_size: 20                          # 接收到多少个点才初始化地图
-      h_batch_parallel: false                 # 批量点到平面更新是否使用TBB并行
+      h_batch_threads: 4                       # 批量点到平面更新的TBB线程数，1表示单线程
 
       # 雷达与IMU相对位姿
       extrinsic_est_en: false                    # 雷达与IMU的相对位姿是否通过预测得到

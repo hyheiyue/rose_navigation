@@ -251,19 +251,22 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
         ++measurement.effective_count;
     };
 
-    if (params_.h_batch_parallel) {
-        // 每个线程独立持有特征分解器和正规方程缓存，避免并行 PCA 时反复分配对象或抢锁。
-        tbb::enumerable_thread_specific<Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>>
-            local_solver([] { return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(); });
-        tbb::enumerable_thread_specific<batch_measurement_result> local_results([] {
-            return batch_measurement_result {};
-        });
-        tbb::enumerable_thread_specific<std::vector<Eigen::Vector3f>> local_near_points([] {
-            std::vector<Eigen::Vector3f> near;
-            near.reserve(NUM_MATCH_POINTS);
-            return near;
-        });
+    // 每个线程独立持有特征分解器和正规方程缓存，避免并行 PCA 时反复分配对象或抢锁。
+    tbb::enumerable_thread_specific<Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>> local_solver(
+        [] { return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(); }
+    );
+    tbb::enumerable_thread_specific<batch_measurement_result> local_results([] {
+        return batch_measurement_result {};
+    });
+    tbb::enumerable_thread_specific<std::vector<Eigen::Vector3f>> local_near_points([] {
+        std::vector<Eigen::Vector3f> near;
+        near.reserve(NUM_MATCH_POINTS);
+        return near;
+    });
 
+    const int h_batch_threads = params_.h_batch_threads > 0 ? params_.h_batch_threads : 1;
+    tbb::task_arena arena(h_batch_threads);
+    arena.execute([&] {
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, N),
             [&](const tbb::blocked_range<size_t>& r) {
@@ -276,20 +279,12 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
                 }
             }
         );
+    });
 
-        for (const auto& local_result: local_results) {
-            result.HTRH.noalias() += local_result.HTRH;
-            result.HTRz.noalias() += local_result.HTRz;
-            result.effective_count += local_result.effective_count;
-        }
-    } else {
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver;
-        std::vector<Eigen::Vector3f> near;
-        near.reserve(NUM_MATCH_POINTS);
-
-        for (size_t i = 0; i < N; ++i) {
-            process_point(i, solver, result, near);
-        }
+    for (const auto& local_result: local_results) {
+        result.HTRH.noalias() += local_result.HTRH;
+        result.HTRz.noalias() += local_result.HTRz;
+        result.effective_count += local_result.effective_count;
     }
 }
 

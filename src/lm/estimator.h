@@ -26,7 +26,7 @@ public:
         int max_iter = 3;
         double map_resolution = 0.1;
         bool extrinsic_est_en = false;
-        bool h_batch_parallel = false;
+        int h_batch_threads = 1;
         double laser_point_cov = 0.01;
         double imu_meas_acc_cov = 0.01;
         double imu_meas_omg_cov = 0.01;
@@ -51,7 +51,7 @@ public:
             max_iter = config.declare<int>("max_iter");
             map_resolution = config.declare<double>("map_resolution");
             extrinsic_est_en = config.declare<bool>("extrinsic_est_en");
-            h_batch_parallel = config.declare<bool>("h_batch_parallel", h_batch_parallel);
+            h_batch_threads = config.declare<int>("h_batch_threads", h_batch_threads);
             laser_point_cov = config.declare<double>("laser_point_cov");
             imu_meas_acc_cov = config.declare<double>("imu_meas_acc_cov");
             imu_meas_omg_cov = config.declare<double>("imu_meas_omg_cov");
