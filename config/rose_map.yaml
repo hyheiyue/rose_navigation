@@ -12,11 +12,12 @@ rose_navigation_map_node:
         log_free: -0.3
         log_min: -5.0
         log_max: 10.0
-        occ_th: 0.01       
+        occ_th: 0.01
         min_shift: 1
         timeout: 15.5
         unknown_is_occupied: false
         use_ray: true
+        tbb_threads: 4
         max_ray_range: 20.0
         voxel_map:
           center: [0.0, 0.0, 0.0]
@@ -24,10 +25,10 @@ rose_navigation_map_node:
           voxel_size: 0.03
       bin_map:
         voxel_size: 0.05
-        max_slope_deg: 30.0
+        max_slope_deg: 10.0
         bottom_z_to_robo_z: -0.2
         top_z_to_robo_z: 0.1
-        count_thresh: 8
+        count_thresh: 0
         static_map_path: "/home/hy/rose_nav/src/bringup_nav/map/simulation/rmuc_2024.yaml"
       esdf:
         use_diagonals: true

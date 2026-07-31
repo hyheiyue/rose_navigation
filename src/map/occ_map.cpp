@@ -17,6 +17,11 @@ namespace rose_nav::map {
 struct OccMap::Impl {
     Impl(const ParamsNode& config) {
         params_.load(config);
+        params_.tbb_threads = std::max(1, params_.tbb_threads);
+        tbb_control_ = std::make_unique<tbb::global_control>(
+            tbb::global_control::max_allowed_parallelism,
+            static_cast<size_t>(params_.tbb_threads)
+        );
         auto voxel_map_config = config.sub("voxel_map");
         float voxel_size = voxel_map_config.declare<double>("voxel_size");
         auto size_vec = voxel_map_config.declare<std::vector<double>>("size");
@@ -41,6 +46,7 @@ struct OccMap::Impl {
     }
     ~Impl() {
         frame_queue_.stop();
+        hit_queue_.stop();
         free_queue_.stop();
         ray_queue_.stop();
 
@@ -50,6 +56,9 @@ struct OccMap::Impl {
 
         if (free_thread_.joinable()) {
             free_thread_.join();
+        }
+        if (hit_thread_.joinable()) {
+            hit_thread_.join();
         }
         if (ray_thread_.joinable()) {
             ray_thread_.join();
@@ -72,7 +81,9 @@ struct OccMap::Impl {
         uint32_t stamp = 0;
         while (rclcpp::ok()) {
             Frame frame;
-            frame_queue_.wait_and_pop(frame);
+            if (!frame_queue_.wait_and_pop(frame)) {
+                break;
+            }
             auto start = std::chrono::steady_clock::now();
             stamp++;
             auto sensor_center = frame.sensor_origin;
@@ -86,20 +97,41 @@ struct OccMap::Impl {
                 ray.outmap.reserve(pts.size());
             }
 
-            hit.indices.reserve(pts.size());
-            for (const auto& pt: pts) {
-                const VoxelKey<3> k_hit = world_to_key(pt);
+            struct ReceiveResult {
+                std::vector<int> inmap;
+                std::vector<VoxelKey<3>> outmap;
+            };
+            tbb::enumerable_thread_specific<ReceiveResult> tls;
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, pts.size(), 1024),
+                [&](const tbb::blocked_range<size_t>& range) {
+                    auto& local = tls.local();
+                    local.inmap.reserve(local.inmap.size() + range.size());
+                    if (ray_buf) {
+                        local.outmap.reserve(local.outmap.size() + range.size());
+                    }
 
-                int idx = key_to_index(k_hit);
-                if (idx >= 0) {
+                    for (size_t i = range.begin(); i != range.end(); ++i) {
+                        const VoxelKey<3> k_hit = world_to_key(pts[i]);
+                        const int idx = key_to_index(k_hit);
+                        if (idx >= 0) {
+                            local.inmap.push_back(idx);
+                        } else if (ray_buf) {
+                            local.outmap.push_back(k_hit);
+                        }
+                    }
+                }
+            );
+
+            for (const auto& local: tls) {
+                for (const int idx: local.inmap) {
                     hit.try_push(idx, stamp);
+                    if (ray_buf) {
+                        ray_buf->try_push(idx, stamp);
+                    }
                 }
                 if (ray_buf) {
-                    if (idx >= 0) {
-                        ray_buf->try_push(idx, stamp);
-                    } else {
-                        ray.outmap.push_back(k_hit);
-                    }
+                    ray.outmap.insert(ray.outmap.end(), local.outmap.begin(), local.outmap.end());
                 }
             }
 
@@ -122,18 +154,26 @@ struct OccMap::Impl {
     void hit() noexcept {
         while (rclcpp::ok()) {
             IdxSnap<double> hit;
-            hit_queue_.wait_and_pop(hit);
-            auto start = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < hit.indices.size(); ++i) {
-                int idx = hit.indices[i];
-                auto cell = get_cell(idx);
-                auto& c = cell.get();
-
-                // 同一帧内命中同一体素会累计 count，命中越多，占据概率提升越快。
-                c.log_odds = std::max(c.log_odds + params_.log_hit * hit.count[i], params_.log_min);
-                c.last_update = hit.ctx;
-                track_state(idx);
+            if (!hit_queue_.wait_and_pop(hit)) {
+                break;
             }
+            auto start = std::chrono::steady_clock::now();
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, hit.indices.size(), 256),
+                [&](const tbb::blocked_range<size_t>& range) {
+                    for (size_t i = range.begin(); i != range.end(); ++i) {
+                        const int idx = hit.indices[i];
+                        auto cell = get_cell(idx);
+                        auto& c = cell.get();
+
+                        // 同一帧内命中同一体素会累计 count，命中越多，占据概率提升越快。
+                        c.log_odds =
+                            std::max(c.log_odds + params_.log_hit * hit.count[i], params_.log_min);
+                        c.last_update = hit.ctx;
+                        track_state(idx, is_occupied_cell(c));
+                    }
+                }
+            );
 
             auto end = std::chrono::steady_clock::now();
             log_ctx_.hit_cost += std::chrono::duration<double, std::milli>(end - start).count();
@@ -143,20 +183,29 @@ struct OccMap::Impl {
     void free() noexcept {
         while (rclcpp::ok()) {
             IdxSnap<double> free;
-            free_queue_.wait_and_pop(free);
-            auto start = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < free.indices.size(); ++i) {
-                int idx = free.indices[i];
-
-                auto cell = get_cell(idx);
-                auto& c = cell.get();
-
-                // 射线穿过的体素被认为是空闲区域，log_free 通常为负值，用于降低占据置信度。
-                c.log_odds =
-                    std::min(c.log_odds + params_.log_free * free.count[i], params_.log_max);
-                c.last_update = free.ctx;
-                track_state(idx);
+            if (!free_queue_.wait_and_pop(free)) {
+                break;
             }
+            auto start = std::chrono::steady_clock::now();
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, free.indices.size(), 256),
+                [&](const tbb::blocked_range<size_t>& range) {
+                    for (size_t i = range.begin(); i != range.end(); ++i) {
+                        const int idx = free.indices[i];
+
+                        auto cell = get_cell(idx);
+                        auto& c = cell.get();
+
+                        // 射线穿过的体素被认为是空闲区域，log_free 通常为负值，用于降低占据置信度。
+                        c.log_odds = std::min(
+                            c.log_odds + params_.log_free * free.count[i],
+                            params_.log_max
+                        );
+                        c.last_update = free.ctx;
+                        track_state(idx, is_occupied_cell(c));
+                    }
+                }
+            );
             auto end = std::chrono::steady_clock::now();
             log_ctx_.free_cost += std::chrono::duration<double, std::milli>(end - start).count();
             log_ctx_.free_count += free.indices.size();
@@ -172,7 +221,9 @@ struct OccMap::Impl {
 
         while (rclcpp::ok()) {
             Ray ray;
-            ray_queue_.wait_and_pop(ray);
+            if (!ray_queue_.wait_and_pop(ray)) {
+                break;
+            }
 
             auto start = std::chrono::steady_clock::now();
             stamp++;
@@ -271,21 +322,29 @@ struct OccMap::Impl {
         if (idx < 0)
             return params_.unknown_is_occupied;
         const Cell& c = voxel_map_->grid[idx];
+        return is_occupied_cell(c);
+    }
 
+    inline bool is_occupied_cell(const Cell& c) const noexcept {
         // 除占据概率外，还要求更新时间没有超时，避免动态障碍长期残留。
         return c.log_odds > params_.occ_th && std::abs(c.last_update - now_) < params_.timeout;
     }
 
     void update(double now) noexcept {
         now_ = now;
-        auto& grid = voxel_map_->grid;
-        const auto N = grid.size();
 
         auto occ_buf_copy = get_occupied_idx();
-        for (const auto& idx: occ_buf_copy) {
-            // 更新时间推进后，原先占据的体素可能因 timeout 变为空闲，需要重新维护索引表。
-            track_state(idx);
-        }
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, occ_buf_copy.size(), 256),
+            [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t i = range.begin(); i != range.end(); ++i) {
+                    const int idx = occ_buf_copy[i];
+                    auto cell = get_cell(idx);
+                    // 更新时间推进后，原先占据的体素可能因 timeout 变为空闲，需要重新维护索引表。
+                    track_state(idx, is_occupied_cell(cell.get()));
+                }
+            }
+        );
     }
     Eigen::Vector3f center() const {
         return voxel_map_->center;
@@ -293,13 +352,18 @@ struct OccMap::Impl {
     std::vector<Eigen::Vector4f> get_occupied_points() const noexcept {
         std::vector<Eigen::Vector4f> pts;
         auto occ_buf = get_occupied_idx();
-        pts.reserve(occ_buf.size());
+        pts.resize(occ_buf.size());
 
-        for (size_t i = 0; i < occ_buf.size(); i++) {
-            int idx = occ_buf[i];
-            auto p = key_to_world(index_to_key(idx));
-            pts.emplace_back(p.x(), p.y(), p.z(), p.z() - voxel_map_->center.z());
-        }
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, occ_buf.size(), 256),
+            [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t i = range.begin(); i != range.end(); ++i) {
+                    const int idx = occ_buf[i];
+                    auto p = key_to_world(index_to_key(idx));
+                    pts[i] = Eigen::Vector4f(p.x(), p.y(), p.z(), p.z() - voxel_map_->center.z());
+                }
+            }
+        );
 
         return pts;
     }
@@ -427,6 +491,7 @@ struct OccMap::Impl {
 
         bool unknown_is_occupied;
         bool use_ray;
+        int tbb_threads = 4;
         void load(const ParamsNode& config) {
             log_hit = config.declare<float>("log_hit");
             log_free = config.declare<float>("log_free");
@@ -438,6 +503,7 @@ struct OccMap::Impl {
             max_ray_range = config.declare<float>("max_ray_range");
             unknown_is_occupied = config.declare<bool>("unknown_is_occupied");
             use_ray = config.declare<bool>("use_ray");
+            tbb_threads = config.declare<int>("tbb_threads", tbb_threads);
         }
     } params_;
     LogCtx log_ctx_;
@@ -495,21 +561,19 @@ struct OccMap::Impl {
             return snap;
         }
     };
-    void track_state(int idx) noexcept {
-        int p = occupied_pos_[idx];
-        bool was_occ = (p != -1);
-        bool now_occ = is_occupied(idx);
+    void track_state(int idx, bool now_occ) noexcept {
+        std::lock_guard<std::mutex> lock(occupied_mutex_);
+        const int p = occupied_pos_[idx];
+        const bool was_occ = (p != -1);
 
         // 维护可 O(1) 删除的占据体素稠密列表，供可视化和 ESDF 重建使用。
         if (was_occ && !now_occ) {
-            std::lock_guard<std::mutex> lock(occupied_mutex_);
             int last = occupied_buffer_idx_.back();
             occupied_buffer_idx_[p] = last;
             occupied_pos_[last] = p;
             occupied_buffer_idx_.pop_back();
             occupied_pos_[idx] = -1;
         } else if (!was_occ && now_occ) {
-            std::lock_guard<std::mutex> lock(occupied_mutex_);
             occupied_pos_[idx] = occupied_buffer_idx_.size();
             occupied_buffer_idx_.push_back(idx);
         }
@@ -527,6 +591,7 @@ struct OccMap::Impl {
     }
     SlidingVoxelMap<3, Cell>::Ptr voxel_map_;
     std::vector<std::unique_ptr<std::mutex>> cell_mutexes_;
+    std::unique_ptr<tbb::global_control> tbb_control_;
 
     double now_;
     LockQueue<IdxSnap<double>> free_queue_, hit_queue_;

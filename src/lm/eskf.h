@@ -199,8 +199,7 @@ public:
             }
 
             Eigen::Matrix<state::value_type, state::DIM, 1> K = PHT / temp;
-            const Eigen::Matrix<state::value_type, state::DIM, 1> dx =
-                K * measurement_result.z;
+            const Eigen::Matrix<state::value_type, state::DIM, 1> dx = K * measurement_result.z;
             x.plus(dx);
 
             last_H = measurement_result.H;

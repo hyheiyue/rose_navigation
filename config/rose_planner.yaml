@@ -31,9 +31,9 @@ rose_navigation_planner_node:
         max_accel: 30.0
         delay_time: 0.0
         blind_radius: 0.5
-        Q: [150.0,150.0,0.1,0.1]
-        R:  [1.0, 1.0]
-        Rd: [50.0,50.0]
+        Q: [150.0, 150.0, 0.1, 0.1]
+        R: [1.0, 1.0]
+        Rd: [50.0, 50.0]
     rose_map:
       odometry_topic: /Odometry
       pointcloud_topic: /cloud_registered
@@ -45,11 +45,12 @@ rose_navigation_planner_node:
         log_free: -0.3
         log_min: -5.0
         log_max: 10.0
-        occ_th: 0.01       
+        occ_th: 0.01
         min_shift: 1
         timeout: 3.5
         unknown_is_occupied: false
         use_ray: true
+        tbb_threads: 4
         max_ray_range: 20.0
         voxel_map:
           center: [0.0, 0.0, 0.0]

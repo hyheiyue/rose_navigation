@@ -22,8 +22,8 @@ public:
     [[nodiscard]] inline __attribute__((always_inline)) bool
     operator()(const PointWithDistance& p1, const PointWithDistance& p2) const;
 
-    [[nodiscard]] inline __attribute__((always_inline)) bool
-    operator<(const PointWithDistance& rhs) const;
+    [[nodiscard]] inline __attribute__((always_inline)) bool operator<(const PointWithDistance& rhs
+    ) const;
 };
 
 class SmallIVox {

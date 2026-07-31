@@ -244,8 +244,8 @@ private:
         int y = 0;
         int z = 0;
 
-        [[nodiscard]] inline __attribute__((always_inline)) bool
-        operator==(const Key& other) const noexcept {
+        [[nodiscard]] inline __attribute__((always_inline)) bool operator==(const Key& other
+        ) const noexcept {
             return x == other.x && y == other.y && z == other.z;
         }
     };
@@ -313,8 +313,8 @@ private:
         return value >= 0 ? value / 2 : (value - 1) / 2;
     }
 
-    [[nodiscard]] inline __attribute__((always_inline)) FineKey
-    point_to_fine_key(const Point& point) const noexcept {
+    [[nodiscard]] inline __attribute__((always_inline)) FineKey point_to_fine_key(const Point& point
+    ) const noexcept {
         return {
             static_cast<int>(std::floor(point.x() * sub_inv_resolution_)),
             static_cast<int>(std::floor(point.y() * sub_inv_resolution_)),
@@ -339,18 +339,18 @@ private:
         };
     }
 
-    [[nodiscard]] static inline __attribute__((always_inline)) uint64_t
-    pack_key(const Key& key) noexcept {
+    [[nodiscard]] static inline __attribute__((always_inline)) uint64_t pack_key(const Key& key
+    ) noexcept {
         constexpr uint64_t mask = (uint64_t { 1 } << 21) - 1;
         return (static_cast<uint64_t>(key.x) & mask) << 42
             | (static_cast<uint64_t>(key.y) & mask) << 21 | (static_cast<uint64_t>(key.z) & mask);
     }
 
-    float resolution_ ;
-    float inv_resolution_ ;
-    float sub_resolution_ ;
-    float sub_inv_resolution_ ;
-    size_t capacity_ ;
+    float resolution_;
+    float inv_resolution_;
+    float sub_resolution_;
+    float sub_inv_resolution_;
+    size_t capacity_;
     std::array<float, 6> group_min_dist2_ {};
 
     VoxelList voxels_;
