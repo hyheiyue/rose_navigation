@@ -17,11 +17,6 @@ namespace rose_nav::map {
 struct OccMap::Impl {
     Impl(const ParamsNode& config) {
         params_.load(config);
-        params_.tbb_threads = std::max(1, params_.tbb_threads);
-        tbb_control_ = std::make_unique<tbb::global_control>(
-            tbb::global_control::max_allowed_parallelism,
-            static_cast<size_t>(params_.tbb_threads)
-        );
         auto voxel_map_config = config.sub("voxel_map");
         float voxel_size = voxel_map_config.declare<double>("voxel_size");
         auto size_vec = voxel_map_config.declare<std::vector<double>>("size");
@@ -333,18 +328,24 @@ struct OccMap::Impl {
     void update(double now) noexcept {
         now_ = now;
 
-        auto occ_buf_copy = get_occupied_idx();
+        auto occ_buf = get_occupied_idx();
+        tbb::enumerable_thread_specific<std::vector<int>> local_expired;
         tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, occ_buf_copy.size(), 256),
+            tbb::blocked_range<size_t>(0, occ_buf.size(), 256),
             [&](const tbb::blocked_range<size_t>& range) {
+                auto& expired = local_expired.local();
+                expired.reserve(expired.size() + range.size());
                 for (size_t i = range.begin(); i != range.end(); ++i) {
-                    const int idx = occ_buf_copy[i];
+                    const int idx = occ_buf[i];
                     auto cell = get_cell(idx);
                     // 更新时间推进后，原先占据的体素可能因 timeout 变为空闲，需要重新维护索引表。
-                    track_state(idx, is_occupied_cell(cell.get()));
+                    if (!is_occupied_cell(cell.get())) {
+                        expired.push_back(idx);
+                    }
                 }
             }
         );
+        remove_expired_occupied(local_expired);
     }
     Eigen::Vector3f center() const {
         return voxel_map_->center;
@@ -491,7 +492,6 @@ struct OccMap::Impl {
 
         bool unknown_is_occupied;
         bool use_ray;
-        int tbb_threads = 4;
         void load(const ParamsNode& config) {
             log_hit = config.declare<float>("log_hit");
             log_free = config.declare<float>("log_free");
@@ -503,7 +503,6 @@ struct OccMap::Impl {
             max_ray_range = config.declare<float>("max_ray_range");
             unknown_is_occupied = config.declare<bool>("unknown_is_occupied");
             use_ray = config.declare<bool>("use_ray");
-            tbb_threads = config.declare<int>("tbb_threads", tbb_threads);
         }
     } params_;
     LogCtx log_ctx_;
@@ -578,6 +577,18 @@ struct OccMap::Impl {
             occupied_buffer_idx_.push_back(idx);
         }
     }
+    void remove_expired_occupied(
+        const tbb::enumerable_thread_specific<std::vector<int>>& expired
+    ) noexcept {
+        for (const auto& local: expired) {
+            for (const int idx: local) {
+                auto cell = get_cell(idx);
+                if (!is_occupied_cell(cell.get())) {
+                    track_state(idx, false);
+                }
+            }
+        }
+    }
     mutable std::mutex occupied_mutex_;
     std::vector<int> occupied_buffer_idx_;
     std::vector<int> occupied_pos_;
@@ -591,7 +602,6 @@ struct OccMap::Impl {
     }
     SlidingVoxelMap<3, Cell>::Ptr voxel_map_;
     std::vector<std::unique_ptr<std::mutex>> cell_mutexes_;
-    std::unique_ptr<tbb::global_control> tbb_control_;
 
     double now_;
     LockQueue<IdxSnap<double>> free_queue_, hit_queue_;

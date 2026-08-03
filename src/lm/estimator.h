@@ -96,30 +96,12 @@ public:
         double plane_d = 0.0;
         bool valid = false;
     };
-    struct VoxelIndexHashCompare {
-        [[nodiscard]] static size_t hash(const SmallOctVox::PositionIndex& index) noexcept {
-            size_t seed = 0;
-            for (int k = 0; k < 3; ++k) {
-                const size_t value = std::hash<int> {}(index[k]);
-                seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
-            }
-            return seed;
-        }
-
-        [[nodiscard]] static bool equal(
-            const SmallOctVox::PositionIndex& lhs,
-            const SmallOctVox::PositionIndex& rhs
-        ) noexcept {
-            return (lhs.array() == rhs.array()).all();
-        }
-    };
-    using PlaneCache =
-        tbb::concurrent_hash_map<SmallOctVox::PositionIndex, PlaneInfo, VoxelIndexHashCompare>;
+    using PlaneCache = tbb::concurrent_hash_map<uint64_t, PlaneInfo>;
     PlaneCache batch_plane_cache_;
     PlaneCache point_plane_cache_;
     static void cache_plane(
         PlaneCache& cache,
-        const SmallOctVox::PositionIndex& voxel_idx,
+        uint64_t voxel_idx,
         const Eigen::Vector3d& normal,
         double plane_d,
         bool valid

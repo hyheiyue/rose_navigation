@@ -20,6 +20,7 @@
 #include <tbb/blocked_range.h>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <thread>
@@ -43,6 +44,8 @@ struct RoseMap::Impl {
         tf_ = std::make_unique<RclTF>(node);
         RCLCPP_INFO_STREAM(node.get_logger(), "[RoseMap] Initializing...");
         auto config = ParamsNode(node, "rose_map");
+        const int tbb_threads = std::max(1, config.declare<int>("tbb_threads", 4));
+        tbb_arena_ = std::make_unique<tbb::task_arena>(tbb_threads);
         occ_map_ = OccMap::create(config.sub("occ_map"));
         auto bin_ph = config.sub("bin_map");
         bin_params_.load(bin_ph);
@@ -103,12 +106,13 @@ struct RoseMap::Impl {
                 }
 
                 current_time_ = frame_time;
-
-                occ_map_->insert_point_cloud(std::move(OccMap::Frame {
-                    .time = current_time_,
-                    .pts = std::move(pts),
-                    .sensor_origin = sensor_in_target.translation().cast<float>(),
-                }));
+                tbb_arena_->execute([&] {
+                    occ_map_->insert_point_cloud(std::move(OccMap::Frame {
+                        .time = current_time_,
+                        .pts = std::move(pts),
+                        .sensor_origin = sensor_in_target.translation().cast<float>(),
+                    }));
+                });
             }
         );
         auto odom_topic = config.declare<std::string>("odometry_topic");
@@ -194,9 +198,13 @@ struct RoseMap::Impl {
             );
 
             auto start = Clock::now();
-            occ_map_->update(current_time_);
-            bin_map_->update(std::bind(&RoseMap::Impl::bin_callback, this, std::placeholders::_1));
-            esdf_->update();
+            tbb_arena_->execute([&] {
+                occ_map_->update(current_time_);
+                // bin_map_->update(
+                //     std::bind(&RoseMap::Impl::bin_callback, this, std::placeholders::_1)
+                // );
+                esdf_->update();
+            });
 
             pub_all();
 
@@ -420,6 +428,7 @@ struct RoseMap::Impl {
 
         return;
     }
+    std::unique_ptr<tbb::task_arena> tbb_arena_;
     std::thread process_thread_;
     OccMap::Ptr occ_map_;
     BinMap::Ptr bin_map_;

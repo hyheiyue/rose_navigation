@@ -40,6 +40,7 @@ rose_navigation_planner_node:
       target_frame: map
       sensor_frame: front_mid360
       max_update_rate: 10
+      tbb_threads: 4
       occ_map:
         log_hit: 0.85
         log_free: -0.3
@@ -50,7 +51,6 @@ rose_navigation_planner_node:
         timeout: 3.5
         unknown_is_occupied: false
         use_ray: true
-        tbb_threads: 4
         max_ray_range: 20.0
         voxel_map:
           center: [0.0, 0.0, 0.0]

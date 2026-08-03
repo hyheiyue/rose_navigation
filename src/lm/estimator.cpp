@@ -9,6 +9,7 @@
 #include "lm/small_ivox.h"
 #include "lm/small_oct_vox.hpp"
 #include <cmath>
+#include <sys/types.h>
 #include <tbb/tbb.h>
 namespace rose_nav::lm {
 constexpr int NUM_MATCH_POINTS = 5;
@@ -71,7 +72,7 @@ Estimator::process_noise_cov() const {
 
 void Estimator::cache_plane(
     PlaneCache& cache,
-    const SmallOctVox::PositionIndex& voxel_idx,
+    uint64_t voxel_idx,
     const Eigen::Vector3d& normal,
     double plane_d,
     bool valid
@@ -135,7 +136,7 @@ void Estimator::h_batch(const state& s, batch_measurement_result& result) noexce
         const Eigen::Vector3d pt_odom_d = pt_odom.template cast<double>();
 
         points_odom_frame[i] = pt_odom_d.cast<float>();
-        const SmallOctVox::PositionIndex voxel_idx = ivox->get_position_index(points_odom_frame[i]);
+        const uint64_t voxel_idx = ivox->get_position_index(points_odom_frame[i]);
 
         Eigen::Vector3d n;
         double d_plane = 0.0;
@@ -304,7 +305,7 @@ void Estimator::h_point(const state& s, point_measurement_result& measurement_re
     // 单点模式以当前状态预测后的 odom 体素为缓存键；如果该体素已经拟合过稳定平面，
     // 后续点或迭代重线性化可直接复用，避免重复近邻搜索和 PCA。
     // 可以缓存的前提是在本次更新结束才会将更新后的点加入ivox，也就是更新过程中ivox完全不变
-    const SmallOctVox::PositionIndex voxel_idx = ivox->get_position_index(point_odom_frame);
+    const uint64_t voxel_idx = ivox->get_position_index(point_odom_frame);
     Eigen::Vector3d normal_d;
     double plane_d = 0.0;
     bool can_reuse_plane = false;

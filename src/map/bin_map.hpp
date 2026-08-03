@@ -2,6 +2,7 @@
 #include "occ_map.hpp"
 #include "utils/rclcpp_parameter_node.hpp"
 #include "voxel_map.hpp"
+#include <cstdint>
 #include <opencv2/opencv.hpp>
 #include <rclcpp/logger.hpp>
 #include <yaml-cpp/yaml.h>
@@ -22,6 +23,10 @@ public:
     void update(const UpdateFunc& update_func) {
         // 由 RoseMap 注入更新逻辑，使 BinMap 既可以接收动态障碍，也可以保留静态地图。
         update_func(this);
+        ++version_;
+    }
+    [[nodiscard]] uint64_t version() const noexcept {
+        return version_;
     }
     std::vector<Eigen::Vector4f> get_occupied_points() const {
         std::vector<Eigen::Vector4f> pts;
@@ -118,6 +123,7 @@ public:
         uint8_t is_static = false;
     };
     HashVoxelMap<2, Cell>::Ptr voxel_map_;
+    uint64_t version_ = 0;
     bool has_static_ = false;
     Eigen::Vector2f static_min_pos_, static_max_pos_;
 };

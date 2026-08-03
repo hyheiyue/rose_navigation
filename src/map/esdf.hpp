@@ -1,7 +1,10 @@
 #pragma once
 #include "bin_map.hpp"
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace rose_nav::map {
 
@@ -30,6 +33,7 @@ public:
         esdf_->slide_to(new_center, [&](int idx) {
 
         });
+        dirty_.store(true, std::memory_order_release);
     }
     float get_esdf(const Eigen::Vector2f& p) {
         int idx = esdf_->world_to_index(p);
@@ -75,6 +79,8 @@ public:
     std::vector<float> dist_to_occ_;
     std::vector<float> dist_to_free_;
     BinMap::Ptr bin_map_;
+    std::atomic_bool dirty_ { true };
+    uint64_t last_bin_version_ = std::numeric_limits<uint64_t>::max();
     // 8 邻域传播方向：前四个是直连邻居，后四个是对角邻居。
     static constexpr int dx8_[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
     static constexpr int dy8_[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };

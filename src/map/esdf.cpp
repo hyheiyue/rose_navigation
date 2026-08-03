@@ -36,8 +36,15 @@ ESDF::ESDF(BinMap::Ptr bin, const ParamsNode& config) {
     step_cost_[1] = vs * std::sqrt(2.0f); // 对角相邻代价
 }
 void ESDF::update() {
+    const uint64_t bin_version = bin_map_->version();
+    if (!dirty_.load(std::memory_order_acquire) && bin_version == last_bin_version_) {
+        return;
+    }
+
     // ESDF 由最新二值占据图完整重建，保证规划查询时读到的是一致的有符号距离场。
     rebuild_signed();
+    last_bin_version_ = bin_version;
+    dirty_.store(false, std::memory_order_release);
 }
 std::vector<Eigen::Vector4f> ESDF::get_occupied_points(int step) const {
     std::vector<Eigen::Vector4f> pts;

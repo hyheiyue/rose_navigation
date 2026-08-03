@@ -26,7 +26,7 @@ public:
         count = 0;
         worst_ = 0;
         max_dist2_ = 0.0f;
-        std::memset(dist2_, 0, sizeof(dist2_));
+        dist2_.fill(0.0f);
     }
 
     inline __attribute__((always_inline)) void try_insert(float dist2, const Point& point) {
@@ -59,7 +59,7 @@ public:
     uint8_t count = 0;
     uint8_t worst_ = 0;
     float max_dist2_ = 0.0f;
-    float dist2_[K] {};
+    std::array<float, K> dist2_ {};
     std::array<Point, K> points_ {};
 
 private:
@@ -90,7 +90,6 @@ class SmallOctVox {
 public:
     using Ptr = std::shared_ptr<SmallOctVox>;
     using Point = Eigen::Vector3f;
-    using PositionIndex = Eigen::Matrix<int, 3, 1>;
     using KNNHeapType = KNNHeap<5, Point>;
 
     inline explicit SmallOctVox(float resolution, size_t capacity = 1000000):
@@ -109,7 +108,7 @@ public:
     }
 
     [[nodiscard]] inline bool add_point(const Point& point) {
-        const FineKey fine_key = point_to_fine_key(point);
+        const Key fine_key = point_to_fine_key(point);
         const Key key { floor_div2(fine_key.x), floor_div2(fine_key.y), floor_div2(fine_key.z) };
         const uint64_t hash_key = pack_key(key);
         const uint8_t local_idx = fine_key_to_local_idx(fine_key);
@@ -142,7 +141,7 @@ public:
         max_num = std::min<size_t>(max_num, 5);
 
         KNNHeapType top_k;
-        const FineKey fine_key = point_to_fine_key(point);
+        const Key fine_key = point_to_fine_key(point);
         const Key key { floor_div2(fine_key.x), floor_div2(fine_key.y), floor_div2(fine_key.z) };
         const uint8_t local_idx = fine_key_to_local_idx(fine_key);
 
@@ -218,10 +217,12 @@ public:
         return resolution_;
     }
 
-    [[nodiscard]] inline __attribute__((always_inline)) PositionIndex
+    [[nodiscard]] inline __attribute__((always_inline)) uint64_t
     get_position_index(const Point& point) const noexcept {
-        const FineKey key = point_to_fine_key(point);
-        return PositionIndex(floor_div2(key.x), floor_div2(key.y), floor_div2(key.z));
+        const Key fine_key = point_to_fine_key(point);
+        const Key key { floor_div2(fine_key.x), floor_div2(fine_key.y), floor_div2(fine_key.z) };
+        const uint64_t hash_key = pack_key(key);
+        return hash_key;
     }
 
     inline void get_points(std::vector<Point>& points) const {
@@ -248,12 +249,6 @@ private:
         ) const noexcept {
             return x == other.x && y == other.y && z == other.z;
         }
-    };
-
-    struct FineKey {
-        int x = 0;
-        int y = 0;
-        int z = 0;
     };
 
     class OctVox {
@@ -313,7 +308,7 @@ private:
         return value >= 0 ? value / 2 : (value - 1) / 2;
     }
 
-    [[nodiscard]] inline __attribute__((always_inline)) FineKey point_to_fine_key(const Point& point
+    [[nodiscard]] inline __attribute__((always_inline)) Key point_to_fine_key(const Point& point
     ) const noexcept {
         return {
             static_cast<int>(std::floor(point.x() * sub_inv_resolution_)),
@@ -323,7 +318,7 @@ private:
     }
 
     [[nodiscard]] static inline __attribute__((always_inline)) uint8_t
-    fine_key_to_local_idx(const FineKey& key) noexcept {
+    fine_key_to_local_idx(const Key& key) noexcept {
         const uint8_t dx = static_cast<uint8_t>(key.x & 1);
         const uint8_t dy = static_cast<uint8_t>(key.y & 1);
         const uint8_t dz = static_cast<uint8_t>(key.z & 1);
